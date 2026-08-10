@@ -4,6 +4,10 @@
     <!-- 基础权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- UDP 广播发现需要:多播锁(防止 WiFi 在休眠时丢弃广播包) -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- 访问 WiFi 信息(拿多播锁需要) -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14 (targetSdk 34) 起,投屏类型前台服务必须声明此权限,否则启动崩溃 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
