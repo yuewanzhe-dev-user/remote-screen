@@ -102,14 +102,67 @@ class BoardDiscovery(private val context: Context) {
             val port = json.optInt("port", 8888)
             // host 优先用 JSON 里的,兜底用来源 IP
             val host = json.optString("ip").ifEmpty { fromIp }
-            val board = Board(name, host, port)
+
+            // 黑板可能有多个网卡(如 WiFi + 设了静态IP的有线网卡),
+            // 每个网卡都会广播一次。这里做筛选:
+            //   - 如果收到多个同名黑板,优先保留和自己同网段的
+            //   - 不同网段的(如不可达的有线网卡地址)仅在没别的选择时才用
             synchronized(lock) {
-                foundBoards[name] = board
+                val existing = foundBoards[name]
+                if (existing != null) {
+                    val mySameSegment = sameSegment(host)
+                    val existingSameSegment = sameSegment(existing.host)
+                    when {
+                        // 新的和已知的都同网段,保留先到的(稳定)
+                        mySameSegment && existingSameSegment -> { /* 不覆盖 */ }
+                        // 新的同网段,旧的不同网段,用新的覆盖
+                        mySameSegment && !existingSameSegment -> foundBoards[name] = Board(name, host, port)
+                        // 新的不同网段,旧的同网段,保留旧的
+                        !mySameSegment && existingSameSegment -> { /* 不覆盖 */ }
+                        // 两个都不同网段,用新的覆盖(随便选一个)
+                        else -> foundBoards[name] = Board(name, host, port)
+                    }
+                } else {
+                    foundBoards[name] = Board(name, host, port)
+                }
             }
-            Log.i(TAG, "发现黑板: $name → $host:$port")
+            Log.i(TAG, "发现黑板: $name → $host:$port (同网段:${sameSegment(host)})")
             notifyFound()
         } catch (e: Exception) {
             Log.w(TAG, "解析广播包失败: $text")
+        }
+    }
+
+    /** 判断给定 IP 是否和 pad 本机在同一网段(前 3 段相同,适用于 /24 小网) */
+    private fun sameSegment(ip: String): Boolean {
+        return try {
+            val myPrefix = getMyIpPrefix() ?: return false
+            val targetPrefix = ip.substringBeforeLast(".")
+            myPrefix == targetPrefix
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** 获取 pad 本机 IP 的前 3 段(如 192.168.124) */
+    private fun getMyIpPrefix(): String? {
+        return try {
+            val interfaces = java.util.Collections.list(java.net.NetworkInterface.getNetworkInterfaces())
+            for (ni in interfaces) {
+                if (!ni.isUp || ni.isLoopback) continue
+                val addrs = java.util.Collections.list(ni.inetAddresses)
+                for (addr in addrs) {
+                    val hostAddr = addr.hostAddress ?: continue
+                    val pure = hostAddr.substringBefore("%")
+                    // 只看 IPv4(含点)
+                    if (pure.contains(".") && !pure.startsWith("127.") && !pure.startsWith("169.254.")) {
+                        return pure.substringBeforeLast(".")
+                    }
+                }
+            }
+            null
+        } catch (e: Exception) {
+            null
         }
     }
 
