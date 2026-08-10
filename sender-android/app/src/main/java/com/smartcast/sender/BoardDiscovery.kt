@@ -1,102 +1,140 @@
 package com.smartcast.sender
 
 import android.content.Context
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.net.wifi.WifiManager
 import android.util.Log
+import org.json.JSONObject
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketException
+import kotlin.concurrent.thread
 
 /**
- * 黑板自动发现(mDNS / DNS-SD)。
+ * 黑板自动发现(UDP 广播方案)。
  *
- * 黑板端会在局域网内广播自身服务,pad 用本类自动搜索,无需手输 IP。
+ * 为什么不用 mDNS:很多校园 WiFi AP 不转发 mDNS 多播包(224.0.0.251),
+ * 导致 pad 搜不到黑板。改用 UDP 广播(255.255.255.255),几乎所有 AP 都转发。
  *
- * 服务类型约定:_smartboard._tcp.
- * 实例名 = 教室名/黑板名(如"三年二班黑板"),pad 端可展示列表让用户选,
- * 或只有一个黑板时自动连接。
+ * 工作方式:
+ *   1. 被动监听:后台监听 UDP 19999,黑板每 2 秒广播一次,收到即发现
+ *   2. 主动查询:启动时发一次 {"cmd":"QUERY"} 广播,黑板会单播回应
  *
- * 原理:AirPlay、Chromecast 等零配置设备都走这套。黑板 IP 怎么变都能自动跟上。
+ * 黑板广播的消息格式(JSON):
+ *   {"name":"智慧黑板","port":8888,"ip":"192.168.x.x"}
  */
 class BoardDiscovery(private val context: Context) {
 
     companion object {
-        const val SERVICE_TYPE = "_smartboard._tcp."
+        const val DISCOVERY_PORT = 19999
         private const val TAG = "BoardDiscovery"
     }
 
-    private val nsdManager by lazy {
-        context.getSystemService(Context.NSD_SERVICE) as NsdManager
-    }
-
-    private var listener: ((List<Board>) -> Unit)? = null
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
-    private val foundBoards = mutableMapOf<String, Board>()
-
     data class Board(
-        val name: String,        // 实例名,如"三年二班黑板"
-        val host: String,        // IP 地址
-        val port: Int            // 端口
+        val name: String,
+        val host: String,
+        val port: Int
     )
 
+    private var socket: DatagramSocket? = null
+    @Volatile private var running = false
+    private var listenerThread: Thread? = null
+    private var onFound: ((List<Board>) -> Unit)? = null
+    // 发现到的黑板,name 去重
+    private val foundBoards = mutableMapOf<String, Board>()
+    private val lock = Any()
+
     /**
-     * 开始搜索黑板。每发现/更新一个黑板就回调一次完整列表。
-     * @param onFound 收到黑板列表(去重)的回调
+     * 开始发现黑板。首次会主动发一次查询,之后持续监听黑板的周期广播。
      */
     fun startDiscovery(onFound: (List<Board>) -> Unit) {
-        listener = onFound
-        foundBoards.clear()
+        this.onFound = onFound
+        running = true
+        listenerThread = thread(name = "board-discovery") {
+            try {
+                // 拿 WiFi 多播锁(广播也需要)
+                val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val multicastLock = wifi.createMulticastLock("smartcast").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
 
-        discoveryListener = object : NsdManager.DiscoveryListener {
-            override fun onStartDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                Log.e(TAG, "启动发现失败: $errorCode")
-            }
+                socket = DatagramSocket(DISCOVERY_PORT).apply {
+                    broadcast = true
+                    soTimeout = 0 // 一直阻塞读
+                }
+                Log.i(TAG, "开始监听 UDP $DISCOVERY_PORT")
 
-            override fun onStopDiscoveryFailed(serviceType: String?, errorCode: Int) {
-                Log.e(TAG, "停止发现失败: $errorCode")
-            }
+                // 主动发一次查询,让黑板立刻回应(不用等它的下一次广播)
+                sendQuery()
 
-            override fun onDiscoveryStarted(serviceType: String?) {
-                Log.i(TAG, "开始搜索黑板 ($serviceType)")
-            }
-
-            override fun onDiscoveryStopped(serviceType: String?) {
-                Log.i(TAG, "停止搜索黑板")
-            }
-
-            override fun onServiceFound(info: NsdServiceInfo) {
-                Log.i(TAG, "发现服务: ${info.serviceName}")
-                // 解析出 IP 和端口
-                nsdManager.resolveService(info, object : NsdManager.ResolveListener {
-                    override fun onServiceResolved(info: NsdServiceInfo) {
-                        val host = info.host?.hostAddress ?: return
-                        val board = Board(info.serviceName, host, info.port)
-                        foundBoards[info.serviceName] = board
-                        Log.i(TAG, "解析成功: ${board.name} → $host:${board.port}")
-                        listener?.invoke(foundBoards.values.toList())
+                val buf = ByteArray(1024)
+                while (running) {
+                    val packet = DatagramPacket(buf, buf.size)
+                    try {
+                        socket?.receive(packet) ?: break
+                    } catch (e: SocketException) {
+                        if (running) Log.w(TAG, "socket 异常: ${e.message}")
+                        break
+                    } catch (e: Exception) {
+                        continue
                     }
-
-                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
-                        Log.w(TAG, "解析失败: ${info.serviceName} ($errorCode)")
-                    }
-                })
-            }
-
-            override fun onServiceLost(info: NsdServiceInfo) {
-                Log.i(TAG, "服务消失: ${info.serviceName}")
-                foundBoards.remove(info.serviceName)
-                listener?.invoke(foundBoards.values.toList())
+                    val text = String(packet.data, 0, packet.length)
+                    handlePacket(text, packet.address.hostAddress ?: continue)
+                }
+                try { multicastLock.release() } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.e(TAG, "发现服务异常: ${e.message}", e)
             }
         }
-
-        nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
     }
 
-    /** 停止搜索 */
-    fun stopDiscovery() {
+    private fun handlePacket(text: String, fromIp: String) {
         try {
-            discoveryListener?.let { nsdManager.stopServiceDiscovery(it) }
+            val json = JSONObject(text)
+            val name = json.optString("name", "未知黑板")
+            val port = json.optInt("port", 8888)
+            // host 优先用 JSON 里的,兜底用来源 IP
+            val host = json.optString("ip").ifEmpty { fromIp }
+            val board = Board(name, host, port)
+            synchronized(lock) {
+                foundBoards[name] = board
+            }
+            Log.i(TAG, "发现黑板: $name → $host:$port")
+            notifyFound()
         } catch (e: Exception) {
-            Log.w(TAG, "停止发现异常: ${e.message}")
+            Log.w(TAG, "解析广播包失败: $text")
         }
-        discoveryListener = null
+    }
+
+    private fun notifyFound() {
+        val list = synchronized(lock) { foundBoards.values.toList() }
+        onFound?.invoke(list)
+    }
+
+    /** 主动发一次查询广播,让黑板立即回应 */
+    private fun sendQuery() {
+        try {
+            thread(name = "board-query") {
+                val s = DatagramSocket().apply { broadcast = true }
+                val data = """{"cmd":"QUERY"}""".toByteArray()
+                val packet = DatagramPacket(
+                    data, data.size,
+                    InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT
+                )
+                s.send(packet)
+                s.close()
+                Log.i(TAG, "已发送查询广播")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "发送查询失败: ${e.message}")
+        }
+    }
+
+    fun stopDiscovery() {
+        running = false
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        try { listenerThread?.interrupt() } catch (_: Exception) {}
     }
 }
