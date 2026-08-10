@@ -116,13 +116,14 @@ class BoardDiscovery(private val context: Context) {
     /** 判断某个 IP 是否是本机地址(用于过滤自己发的广播回环包) */
     private fun isOwnAddress(ip: String): Boolean {
         return try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-            interfaces?.forEach { ni ->
-                ni.inetAddresses?.forEach { addr ->
-                    val hostAddr = addr.hostAddress ?: return@forEach
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
+            outer@ for (ni in interfaces) {
+                val addrs = ni.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val hostAddr = addrs.nextElement().hostAddress ?: continue
                     // 去掉 IPv6 的 scope id(如 fe80::1%wlan0)
                     val pure = hostAddr.substringBefore("%")
-                    if (pure == ip) return true
+                    if (pure == ip) return@outer@ true
                 }
             }
             false
