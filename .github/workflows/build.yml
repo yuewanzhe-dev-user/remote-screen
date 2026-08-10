@@ -57,11 +57,7 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: 下载 Go 依赖并生成 go.sum
-        working-directory: receiver-windows/go
-        run: go mod tidy
-
-      - name: 交叉编译为 Windows EXE(无需本机有 Go)
+      - name: 交叉编译为 Windows EXE(纯标准库,无需下载依赖)
         working-directory: receiver-windows/go
         env:
           GOOS: windows
