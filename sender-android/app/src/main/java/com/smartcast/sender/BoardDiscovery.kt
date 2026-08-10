@@ -79,8 +79,14 @@ class BoardDiscovery(private val context: Context) {
                     } catch (e: Exception) {
                         continue
                     }
+                    val fromIp = packet.address.hostAddress ?: continue
+                    // 过滤掉自己发的包:pad 自己发出的查询广播会回环到自己,
+                    // 不过滤的话会把自己当成黑板解析,出现"未知黑板"假项
+                    if (isOwnAddress(fromIp)) {
+                        continue
+                    }
                     val text = String(packet.data, 0, packet.length)
-                    handlePacket(text, packet.address.hostAddress ?: continue)
+                    handlePacket(text, fromIp)
                 }
                 try { multicastLock.release() } catch (_: Exception) {}
             } catch (e: Exception) {
@@ -104,6 +110,24 @@ class BoardDiscovery(private val context: Context) {
             notifyFound()
         } catch (e: Exception) {
             Log.w(TAG, "解析广播包失败: $text")
+        }
+    }
+
+    /** 判断某个 IP 是否是本机地址(用于过滤自己发的广播回环包) */
+    private fun isOwnAddress(ip: String): Boolean {
+        return try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            interfaces?.forEach { ni ->
+                ni.inetAddresses?.forEach { addr ->
+                    val hostAddr = addr.hostAddress ?: return@forEach
+                    // 去掉 IPv6 的 scope id(如 fe80::1%wlan0)
+                    val pure = hostAddr.substringBefore("%")
+                    if (pure == ip) return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            false
         }
     }
 
