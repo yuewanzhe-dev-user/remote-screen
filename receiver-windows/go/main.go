@@ -121,13 +121,18 @@ func main() {
 func startMDNSBroadcast(port int) {
 	// 构造 mDNS 服务:pad 端搜 _smartboard._tcp. 能发现
 	host, _ := os.Hostname()
+	// 收集本机 IPv4 作为服务的 IP 列表(让 pad 解析时直接拿到 IP)
+	var ips []net.IP
+	for _, ipStr := range getLocalIPv4s() {
+		ips = append(ips, net.ParseIP(ipStr))
+	}
 	service, err := mdns.NewMDNSService(
 		boardName,            // 实例名,pad 端会显示这个名字
 		serviceType,          // _smartboard._tcp.
 		"",                   // domain
-		"",                   // host
+		host,                 // 主机名
 		port,                 // 端口
-		[]string{host},       // 主机别名
+		ips,                  // 本机 IP 列表(类型 []net.IP)
 		[]string{"room=3-2"}, // TXT 记录,可放教室号等
 	)
 	if err != nil {
@@ -141,6 +146,23 @@ func startMDNSBroadcast(port int) {
 		return
 	}
 	server = s
+}
+
+// getLocalIPv4s 获取本机非环回的 IPv4 地址列表
+func getLocalIPv4s() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ips
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ips = append(ips, ipnet.IP.String())
+			}
+		}
+	}
+	return ips
 }
 
 // 启动一个后台 goroutine,每 5 秒打印一次投屏质量
