@@ -1,9 +1,9 @@
 name: 构建 pad 端 APK 和黑板端 EXE
 
-# 触发:push 到 master/main,或网页手动 Run workflow
+# 触发:push 到 main,或网页手动 Run workflow
 on:
   push:
-    branches: [master, main]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -24,9 +24,14 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
-      - name: 生成 Gradle Wrapper
+      - name: 下载 Gradle 8.5 并生成 Wrapper
         working-directory: sender-android
-        run: gradle wrapper --gradle-version 8.5
+        run: |
+          # 下载 Gradle 8.5(系统自带的是 9.x,和 AGP 8.1.4 不兼容,必须用 8.x)
+          wget -q https://services.gradle.org/distributions/gradle-8.5-bin.zip
+          unzip -q gradle-8.5-bin.zip
+          ./gradle-8.5/bin/gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
 
       - name: 编译 Release APK
         working-directory: sender-android
