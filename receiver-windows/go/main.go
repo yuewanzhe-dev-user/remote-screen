@@ -83,11 +83,11 @@ func serveClient(conn net.Conn) {
 	}
 
 	// 3. 启动 ffmpeg:从 stdin 收 H.264,解码后用 SDL 窗口显示
+	// 注意:新版 ffmpeg 的 h264 raw demuxer 不再支持 -video_size,分辨率解码器会自己从流里读
 	cmd := exec.Command(ffmpegPath,
 		"-probesize", "32",
 		"-analyzeduration", "0",
 		"-f", "h264",
-		"-video_size", fmt.Sprintf("%dx%d", width, height),
 		"-i", "pipe:0",
 		"-pix_fmt", "yuv420p",
 		"-f", "sdl", "智慧投屏 - 黑板端",
