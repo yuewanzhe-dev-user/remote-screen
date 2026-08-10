@@ -3,14 +3,21 @@ package main
 // 智慧投屏 - 黑板端接收器 (Go 版,一键启动)
 // =====================================================
 // 1. 监听 TCP,接收 pad 推来的 H.264 流,调用 ffplay 解码全屏显示
-// 2. 通过 mDNS 在局域网广播自身,让 pad 自动发现(无需手输 IP)
-//    —— 纯标准库实现,主动周期广播 + 响应查询,不依赖第三方库
+// 2. 通过 UDP 广播在局域网宣告自身,让 pad 自动发现(无需手输 IP)
+//    —— 不用 mDNS 多播(很多 WiFi AP 不转发多播),改用 UDP 广播
+//       (几乎所有 AP 都转发广播,兼容性远好于多播)
 // 3. 多 pad 冲突处理:新的 pad 连上自动顶掉旧的
 // 4. 投屏质量统计:每隔几秒打印码率/帧数/时长
 //
-// 协议(与 pad 端 ScreenCastService 对齐):
+// 投屏协议(与 pad 端 ScreenCastService 对齐):
 //   连接建立后前 8 字节 = [width(4,big-endian)][height(4,big-endian)]
-//   隄后 = H.264 裸流
+//   随后 = H.264 裸流
+//
+// 广播发现协议(与 pad 端 BoardDiscovery 对齐):
+//   黑板每 2 秒往 UDP 端口 19999 广播一个 JSON:
+//     {"name":"智慧黑板","port":8888,"ip":"192.168.x.x"}
+//   pad 监听 19999,收到广播即发现黑板。
+//   pad 也可主动发 {"cmd":"QUERY"} 到 19999,黑板收到后单播回应。
 //
 // 运行(双击 投屏接收端.exe 即可):
 //   投屏接收端.exe            默认端口 8888
@@ -20,11 +27,13 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,8 +41,7 @@ import (
 const (
 	defaultPort   = 8888
 	boardName     = "智慧黑板"
-	serviceType   = "_smartboard._tcp."
-	mdnsMulticast = "224.0.0.251:5353"
+	discoveryPort = 19999 // pad/黑板 约定的发现端口
 )
 
 var (
@@ -41,7 +49,7 @@ var (
 	currentCancel  func()
 	currentPadAddr string
 	stats          = &streamStats{}
-	mdnsOK         = false
+	broadcastOK    = false
 )
 
 type streamStats struct {
@@ -76,6 +84,14 @@ func (s *streamStats) reset() {
 	s.frames = 0
 }
 
+// 发现协议的消息格式
+type discoveryMsg struct {
+	Name string `json:"name"` // 黑板名称
+	Port int    `json:"port"` // 投屏服务端口
+	IP   string `json:"ip"`   // 黑板 IP(辅助)
+	Cmd  string `json:"cmd"`  // QUERY 表示 pad 主动查询
+}
+
 func main() {
 	port := defaultPort
 	if len(os.Args) > 1 {
@@ -85,13 +101,13 @@ func main() {
 		}
 	}
 
-	// 启动 mDNS 广播(让 pad 自动发现本黑板)
-	startMDNSBroadcast(port)
+	// 启动 UDP 广播发现服务
+	startDiscoveryService(port)
 
-	if mdnsOK {
+	if broadcastOK {
 		fmt.Printf("📢 局域网广播中(名称:%s),pad 可自动发现\n", boardName)
 	} else {
-		fmt.Println("ℹ️ mDNS 未启动,pad 需手输 IP 投屏")
+		fmt.Println("ℹ️ 广播服务未启动,pad 需手输 IP 投屏")
 	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
@@ -120,159 +136,86 @@ func main() {
 }
 
 // =====================================================
-// mDNS 广播(纯标准库实现)
+// UDP 广播发现服务
 // =====================================================
 //
-// 策略:既主动周期广播宣告,也响应 pad 发来的查询。
-// 这样无论 pad 的 NsdManager 是被动监听还是主动查询,都能发现。
+// 两个职责:
+//  1. 主动广播:每 2 秒往 255.255.255.255:19999 发一次宣告(让被动监听的 pad 发现)
+//  2. 响应查询:监听 19999,收到 pad 发的 QUERY 就单播回应(让主动查询的 pad 发现)
 //
-// 主动广播:每 3 秒往 224.0.0.251:5353 发一个包含 PTR/SRV/A 记录的响应包
-// 响应查询:监听 5353,收到任意 DNS 查询就回一个完整的响应包
+// 双管齐下,覆盖 pad 端两种工作模式。
 
-func startMDNSBroadcast(port int) {
-	// 准备预编码的广播包(每个本机 IP 一个)
+func startDiscoveryService(port int) {
 	ips := getLocalIPv4s()
 	if len(ips) == 0 {
-		fmt.Println("⚠️ 未找到本机 IPv4 地址,mDNS 无法启动")
+		fmt.Println("⚠️ 未找到本机 IPv4 地址,广播发现无法启动")
 		return
 	}
 
-	// 起一个监听 socket 响应查询
-	addr, err := net.ResolveUDPAddr("udp4", mdnsMulticast)
+	// 监听 UDP 19999,收 pad 的查询并回应
+	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%d", discoveryPort))
 	if err != nil {
-		fmt.Printf("⚠️ mDNS 地址解析失败:%v\n", err)
+		fmt.Printf("⚠️ 广播地址解析失败:%v\n", err)
 		return
 	}
-
-	listener, err := net.ListenMulticastUDP("udp4", nil, addr)
+	listener, err := net.ListenUDP("udp4", addr)
 	if err != nil {
-		fmt.Printf("⚠️ mDNS 多播监听失败:%v\n", err)
-		fmt.Println("   (不影响手输 IP 投屏)")
-		// 即使监听失败,也尝试主动广播
-	} else {
-		go respondQueries(listener, port, ips)
+		fmt.Printf("⚠️ 广播监听失败:%v(检查端口 %d 是否被占用)\n", err, discoveryPort)
+		return
 	}
+	go respondDiscoveryQueries(listener, port, ips)
 
-	// 主动广播 goroutine
-	go announceLoop(port, ips)
+	// 主动周期广播
+	go broadcastLoop(port, ips)
 
-	mdnsOK = true
+	broadcastOK = true
 }
 
-// respondQueries 监听 5353,收到查询就回一个完整响应包
-func respondQueries(conn *net.UDPConn, port int, ips []string) {
-	buf := make([]byte, 1500)
+// respondDiscoveryQueries 监听 pad 发来的查询,收到就回应
+func respondDiscoveryQueries(conn *net.UDPConn, port int, ips []string) {
+	buf := make([]byte, 1024)
 	for {
 		n, remote, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			return
 		}
-		if n < 12 {
-			continue
+		// 尝试解析,pad 可能发 {"cmd":"QUERY"}
+		var msg discoveryMsg
+		isQuery := false
+		if json.Unmarshal(buf[:n], &msg) == nil {
+			if msg.Cmd == "QUERY" {
+				isQuery = true
+			}
+		} else if strings.Contains(string(buf[:n]), "QUERY") {
+			// 兼容非 JSON 的查询
+			isQuery = true
 		}
-		// 收到任何 mDNS 查询,都回我们的服务宣告(单播回给查询者)
-		packet := buildAnnouncement(port, ips)
-		conn.WriteToUDP(packet, remote)
+		if isQuery {
+			// 单播回应 pad
+			resp := discoveryMsg{Name: boardName, Port: port, IP: ips[0]}
+			data, _ := json.Marshal(resp)
+			conn.WriteToUDP(data, remote)
+		}
 	}
 }
 
-// announceLoop 每 3 秒主动往多播地址发一次服务宣告
-func announceLoop(port int, ips []string) {
-	addr, err := net.ResolveUDPAddr("udp4", mdnsMulticast)
+// broadcastLoop 每 2 秒向 255.255.255.255:19999 广播一次服务宣告
+func broadcastLoop(port int, ips []string) {
+	bcastAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("255.255.255.255:%d", discoveryPort))
 	if err != nil {
 		return
 	}
 	for {
-		packet := buildAnnouncement(port, ips)
-		// 用独立的 socket 发,避免和监听 socket 冲突
-		conn, err := net.DialUDP("udp4", nil, addr)
+		msg := discoveryMsg{Name: boardName, Port: port, IP: ips[0]}
+		data, _ := json.Marshal(msg)
+		// 每次新建 socket 发广播(简单可靠)
+		conn, err := net.DialUDP("udp4", nil, bcastAddr)
 		if err == nil {
-			conn.Write(packet)
+			conn.Write(data)
 			conn.Close()
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
-}
-
-// buildAnnouncement 构造一个 mDNS 响应包,包含 PTR/SRV/A 三类记录
-// 让 pad 的 NsdManager 能解析出服务名、端口、IP
-func buildAnnouncement(port int, ips []string) []byte {
-	var buf []byte
-	instanceLabels := splitLabels(boardName)
-	typeLabels := []string{"_smartboard", "_tcp", "local"}
-	hostName := "smartboard.local"
-	hostLabels := splitLabels(hostName)
-
-	// DNS Header:响应,1 个回答
-	header := []byte{
-		0x00, 0x00, // Transaction ID
-		0x84, 0x00, // Flags: response, authoritative answer
-		0x00, 0x00, // Questions
-		0x00, 0x00, // Answer RRs(后面填)
-		0x00, 0x00, // Authority
-		0x00, 0x00, // Additional
-	}
-
-	// 收集所有 answer 记录
-	var answers [][]byte
-
-	// PTR: _smartboard._tcp.local -> <实例名>._smartboard._tcp.local
-	ptrName := encodeLabels(typeLabels)
-	ptrRdata := encodeLabels(append(append([]string{}, instanceLabels...), typeLabels...))
-	answers = append(answers, buildRecord(ptrName, 12, 4500, ptrRdata)) // type 12 = PTR, class 32768|IN
-
-	// SRV: <实例名>._smartboard._tcp.local -> priority=0, weight=0, port, target=smartboard.local
-	srvName := encodeLabels(append(append([]string{}, instanceLabels...), typeLabels...))
-	srvRdata := []byte{0x00, 0x00, 0x00, 0x00} // priority + weight
-	srvRdata = append(srvRdata, byte(port>>8), byte(port&0xff))
-	srvRdata = append(srvRdata, encodeLabels(hostLabels)...)
-	answers = append(answers, buildRecord(srvName, 33, 4500, srvRdata)) // type 33 = SRV
-
-	// A: smartboard.local -> 每个本机 IP 一条 A 记录
-	aName := encodeLabels(hostLabels)
-	for _, ipStr := range ips {
-		ip := net.ParseIP(ipStr).To4()
-		if ip == nil {
-			continue
-		}
-		answers = append(answers, buildRecord(aName, 1, 4500, ip)) // type 1 = A
-	}
-
-	// 回填 answer 数量
-	binary.BigEndian.PutUint16(header[6:8], uint16(len(answers)))
-	buf = append(buf, header...)
-	for _, a := range answers {
-		buf = append(buf, a...)
-	}
-	return buf
-}
-
-// buildRecord 构造一条 DNS 资源记录
-func buildRecord(name []byte, rtype int, rclass int, rdata []byte) []byte {
-	var rec []byte
-	rec = append(rec, name...)
-	rec = append(rec, byte(rtype>>8), byte(rtype&0xff))
-	rec = append(rec, byte(rclass>>8), byte(rclass&0xff))
-	rec = append(rec, 0, 0, 0, 75) // TTL 75 秒(mDNS 推荐值)
-	rec = append(rec, byte(len(rdata)>>8), byte(len(rdata)&0xff))
-	rec = append(rec, rdata...)
-	return rec
-}
-
-// encodeLabels 把 ["a","b"] 编码成 DNS 标签格式: 1a1b0
-func encodeLabels(parts []string) []byte {
-	var out []byte
-	for _, p := range parts {
-		out = append(out, byte(len(p)))
-		out = append(out, []byte(p)...)
-	}
-	out = append(out, 0x00)
-	return out
-}
-
-// splitLabels 按非字母数字切分名字成多个标签(中文按整段处理)
-func splitLabels(s string) []string {
-	return []string{s}
 }
 
 // =====================================================
