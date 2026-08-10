@@ -52,13 +52,8 @@ var (
 	broadcastOK    = false
 )
 
-// 投屏会话管理:用唯一 sessionID 解决并发顶替时的状态错乱
-// 每个 serveClient 持有自己的 sessionID,顶替时只认"当前活动 sessionID"是否还是自己
-var (
-	sessionMu  sync.Mutex
-	activeSession int64  // 当前活动会话 ID(0 表示无会话)
-	localIPs  []string    // 本机有效 IP 缓存
-)
+// 投屏会话管理:用 currentPadAddr 判断"我还是不是当前活动会话"
+// 顶替时只清理属于自己的全局状态,避免并发下错乱
 
 type streamStats struct {
 	mu         sync.Mutex
@@ -278,12 +273,6 @@ func durStr(d time.Duration) string {
 
 func serveClient(conn net.Conn) {
 	addr := conn.RemoteAddr().String()
-
-	// 分配本会话唯一 ID,用于在退出时判断"我还是不是当前活动会话"
-	sessionMu.Lock()
-	activeSession++
-	mySession := activeSession
-	sessionMu.Unlock()
 
 	// === 多 pad 冲突处理:新连接顶掉旧的 ===
 	// 用 currentCancel 通道通知旧会话退出
