@@ -90,6 +90,13 @@ func main() {
 	// 启动 mDNS 广播(让 pad 自动发现本黑板)
 	startMDNSBroadcast(port)
 
+	// 根据 mDNS 实际状态显示提示
+	if mdnsOK {
+		fmt.Printf("📢 局域网广播中(名称:%s),pad 可自动发现\n", boardName)
+	} else {
+		fmt.Println("ℹ️ mDNS 未启动,pad 需手输 IP 投屏")
+	}
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
 		fmt.Printf("❌ 监听失败:%v(检查端口 %d 是否被占用)\n", err, port)
@@ -103,7 +110,6 @@ func main() {
 
 	fmt.Println("================================================")
 	fmt.Printf("✅ 黑板端已启动,监听 0.0.0.0:%d,等待 pad 连接…\n", port)
-	fmt.Printf("📢 局域网广播中(名称:%s),pad 可自动发现\n", boardName)
 	fmt.Println("提示:关闭本窗口或按 Ctrl+C 退出")
 	fmt.Println("================================================")
 
@@ -117,20 +123,31 @@ func main() {
 	}
 }
 
+// mdnsOK 标记 mDNS 是否成功启动(给 main 显示正确提示用)
+var mdnsOK = false
+
 // startMDNSBroadcast 用 hashicorp/mdns 库在局域网广播本黑板
 func startMDNSBroadcast(port int) {
 	// 构造 mDNS 服务:pad 端搜 _smartboard._tcp. 能发现
-	host, _ := os.Hostname()
+	// host 必须是 FQDN(完整域名,以点结尾),否则 mdns 库报错
+	// 用 .local. 后缀是 mDNS 标准的本地域名约定
+	rawHost, _ := os.Hostname()
+	if rawHost == "" {
+		rawHost = "smartboard"
+	}
+	host := rawHost + ".local."
+
 	// 收集本机 IPv4 作为服务的 IP 列表(让 pad 解析时直接拿到 IP)
 	var ips []net.IP
 	for _, ipStr := range getLocalIPv4s() {
 		ips = append(ips, net.ParseIP(ipStr))
 	}
+
 	service, err := mdns.NewMDNSService(
 		boardName,            // 实例名,pad 端会显示这个名字
 		serviceType,          // _smartboard._tcp.
 		"",                   // domain
-		host,                 // 主机名
+		host,                 // 主机名(FQDN,以点结尾)
 		port,                 // 端口
 		ips,                  // 本机 IP 列表(类型 []net.IP)
 		[]string{"room=3-2"}, // TXT 记录,可放教室号等
@@ -146,6 +163,7 @@ func startMDNSBroadcast(port int) {
 		return
 	}
 	server = s
+	mdnsOK = true
 }
 
 // getLocalIPv4s 获取本机非环回的 IPv4 地址列表
