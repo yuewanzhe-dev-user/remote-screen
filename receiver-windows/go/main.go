@@ -4,12 +4,13 @@ package main
 // =====================================================
 // 1. 监听 TCP,接收 pad 推来的 H.264 流,调用 ffplay 解码全屏显示
 // 2. 通过 mDNS 在局域网广播自身,让 pad 自动发现(无需手输 IP)
+//    —— 纯标准库实现,主动周期广播 + 响应查询,不依赖第三方库
 // 3. 多 pad 冲突处理:新的 pad 连上自动顶掉旧的
 // 4. 投屏质量统计:每隔几秒打印码率/帧数/时长
 //
 // 协议(与 pad 端 ScreenCastService 对齐):
 //   连接建立后前 8 字节 = [width(4,big-endian)][height(4,big-endian)]
-//   随后 = H.264 裸流
+//   隄后 = H.264 裸流
 //
 // 运行(双击 投屏接收端.exe 即可):
 //   投屏接收端.exe            默认端口 8888
@@ -26,26 +27,23 @@ import (
 	"os/exec"
 	"sync"
 	"time"
-
-	"github.com/hashicorp/mdns"
 )
 
 const (
-	defaultPort = 8888
-	boardName   = "智慧黑板" // 显示给 pad 的名称(mDNS 实例名)
-	serviceType = "_smartboard._tcp."
+	defaultPort   = 8888
+	boardName     = "智慧黑板"
+	serviceType   = "_smartboard._tcp."
+	mdnsMulticast = "224.0.0.251:5353"
 )
 
-// 全局:当前正在投屏的会话。新的 pad 连上会把旧的顶掉(冲突处理)
 var (
 	currentMu      sync.Mutex
-	currentCancel  func()  // 终止当前投屏会话的函数
-	currentPadAddr string  // 当前投屏的 pad 地址
+	currentCancel  func()
+	currentPadAddr string
 	stats          = &streamStats{}
-	server         *mdns.Server
+	mdnsOK         = false
 )
 
-// 投屏质量统计
 type streamStats struct {
 	mu         sync.Mutex
 	startTime  time.Time
@@ -90,7 +88,6 @@ func main() {
 	// 启动 mDNS 广播(让 pad 自动发现本黑板)
 	startMDNSBroadcast(port)
 
-	// 根据 mDNS 实际状态显示提示
 	if mdnsOK {
 		fmt.Printf("📢 局域网广播中(名称:%s),pad 可自动发现\n", boardName)
 	} else {
@@ -105,7 +102,6 @@ func main() {
 		return
 	}
 
-	// 启动质量统计后台打印
 	go statsPrinter()
 
 	fmt.Println("================================================")
@@ -123,67 +119,166 @@ func main() {
 	}
 }
 
-// mdnsOK 标记 mDNS 是否成功启动(给 main 显示正确提示用)
-var mdnsOK = false
+// =====================================================
+// mDNS 广播(纯标准库实现)
+// =====================================================
+//
+// 策略:既主动周期广播宣告,也响应 pad 发来的查询。
+// 这样无论 pad 的 NsdManager 是被动监听还是主动查询,都能发现。
+//
+// 主动广播:每 3 秒往 224.0.0.251:5353 发一个包含 PTR/SRV/A 记录的响应包
+// 响应查询:监听 5353,收到任意 DNS 查询就回一个完整的响应包
 
-// startMDNSBroadcast 用 hashicorp/mdns 库在局域网广播本黑板
 func startMDNSBroadcast(port int) {
-	// 构造 mDNS 服务:pad 端搜 _smartboard._tcp. 能发现
-	// host 必须是 FQDN(完整域名,以点结尾),否则 mdns 库报错
-	// 用 .local. 后缀是 mDNS 标准的本地域名约定
-	rawHost, _ := os.Hostname()
-	if rawHost == "" {
-		rawHost = "smartboard"
-	}
-	host := rawHost + ".local."
-
-	// 收集本机 IPv4 作为服务的 IP 列表(让 pad 解析时直接拿到 IP)
-	var ips []net.IP
-	for _, ipStr := range getLocalIPv4s() {
-		ips = append(ips, net.ParseIP(ipStr))
-	}
-
-	service, err := mdns.NewMDNSService(
-		boardName,            // 实例名,pad 端会显示这个名字
-		serviceType,          // _smartboard._tcp.
-		"",                   // domain
-		host,                 // 主机名(FQDN,以点结尾)
-		port,                 // 端口
-		ips,                  // 本机 IP 列表(类型 []net.IP)
-		[]string{"room=3-2"}, // TXT 记录,可放教室号等
-	)
-	if err != nil {
-		fmt.Printf("⚠️ mDNS 服务初始化失败:%v(不影响手输 IP 投屏)\n", err)
+	// 准备预编码的广播包(每个本机 IP 一个)
+	ips := getLocalIPv4s()
+	if len(ips) == 0 {
+		fmt.Println("⚠️ 未找到本机 IPv4 地址,mDNS 无法启动")
 		return
 	}
 
-	s, err := mdns.NewServer(&mdns.Config{Zone: service})
+	// 起一个监听 socket 响应查询
+	addr, err := net.ResolveUDPAddr("udp4", mdnsMulticast)
 	if err != nil {
-		fmt.Printf("⚠️ mDNS 启动失败:%v(不影响手输 IP 投屏)\n", err)
+		fmt.Printf("⚠️ mDNS 地址解析失败:%v\n", err)
 		return
 	}
-	server = s
+
+	listener, err := net.ListenMulticastUDP("udp4", nil, addr)
+	if err != nil {
+		fmt.Printf("⚠️ mDNS 多播监听失败:%v\n", err)
+		fmt.Println("   (不影响手输 IP 投屏)")
+		// 即使监听失败,也尝试主动广播
+	} else {
+		go respondQueries(listener, port, ips)
+	}
+
+	// 主动广播 goroutine
+	go announceLoop(port, ips)
+
 	mdnsOK = true
 }
 
-// getLocalIPv4s 获取本机非环回的 IPv4 地址列表
-func getLocalIPv4s() []string {
-	var ips []string
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ips
-	}
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				ips = append(ips, ipnet.IP.String())
-			}
+// respondQueries 监听 5353,收到查询就回一个完整响应包
+func respondQueries(conn *net.UDPConn, port int, ips []string) {
+	buf := make([]byte, 1500)
+	for {
+		n, remote, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
 		}
+		if n < 12 {
+			continue
+		}
+		// 收到任何 mDNS 查询,都回我们的服务宣告(单播回给查询者)
+		packet := buildAnnouncement(port, ips)
+		conn.WriteToUDP(packet, remote)
 	}
-	return ips
 }
 
-// 启动一个后台 goroutine,每 5 秒打印一次投屏质量
+// announceLoop 每 3 秒主动往多播地址发一次服务宣告
+func announceLoop(port int, ips []string) {
+	addr, err := net.ResolveUDPAddr("udp4", mdnsMulticast)
+	if err != nil {
+		return
+	}
+	for {
+		packet := buildAnnouncement(port, ips)
+		// 用独立的 socket 发,避免和监听 socket 冲突
+		conn, err := net.DialUDP("udp4", nil, addr)
+		if err == nil {
+			conn.Write(packet)
+			conn.Close()
+		}
+		time.Sleep(3 * time.Second)
+	}
+}
+
+// buildAnnouncement 构造一个 mDNS 响应包,包含 PTR/SRV/A 三类记录
+// 让 pad 的 NsdManager 能解析出服务名、端口、IP
+func buildAnnouncement(port int, ips []string) []byte {
+	var buf []byte
+	instanceLabels := splitLabels(boardName)
+	typeLabels := []string{"_smartboard", "_tcp", "local"}
+	hostName := "smartboard.local"
+	hostLabels := splitLabels(hostName)
+
+	// DNS Header:响应,1 个回答
+	header := []byte{
+		0x00, 0x00, // Transaction ID
+		0x84, 0x00, // Flags: response, authoritative answer
+		0x00, 0x00, // Questions
+		0x00, 0x00, // Answer RRs(后面填)
+		0x00, 0x00, // Authority
+		0x00, 0x00, // Additional
+	}
+
+	// 收集所有 answer 记录
+	var answers [][]byte
+
+	// PTR: _smartboard._tcp.local -> <实例名>._smartboard._tcp.local
+	ptrName := encodeLabels(typeLabels)
+	ptrRdata := encodeLabels(append(append([]string{}, instanceLabels...), typeLabels...))
+	answers = append(answers, buildRecord(ptrName, 12, 4500, ptrRdata)) // type 12 = PTR, class 32768|IN
+
+	// SRV: <实例名>._smartboard._tcp.local -> priority=0, weight=0, port, target=smartboard.local
+	srvName := encodeLabels(append(append([]string{}, instanceLabels...), typeLabels...))
+	srvRdata := []byte{0x00, 0x00, 0x00, 0x00} // priority + weight
+	srvRdata = append(srvRdata, byte(port>>8), byte(port&0xff))
+	srvRdata = append(srvRdata, encodeLabels(hostLabels)...)
+	answers = append(answers, buildRecord(srvName, 33, 4500, srvRdata)) // type 33 = SRV
+
+	// A: smartboard.local -> 每个本机 IP 一条 A 记录
+	aName := encodeLabels(hostLabels)
+	for _, ipStr := range ips {
+		ip := net.ParseIP(ipStr).To4()
+		if ip == nil {
+			continue
+		}
+		answers = append(answers, buildRecord(aName, 1, 4500, ip)) // type 1 = A
+	}
+
+	// 回填 answer 数量
+	binary.BigEndian.PutUint16(header[6:8], uint16(len(answers)))
+	buf = append(buf, header...)
+	for _, a := range answers {
+		buf = append(buf, a...)
+	}
+	return buf
+}
+
+// buildRecord 构造一条 DNS 资源记录
+func buildRecord(name []byte, rtype int, rclass int, rdata []byte) []byte {
+	var rec []byte
+	rec = append(rec, name...)
+	rec = append(rec, byte(rtype>>8), byte(rtype&0xff))
+	rec = append(rec, byte(rclass>>8), byte(rclass&0xff))
+	rec = append(rec, 0, 0, 0, 75) // TTL 75 秒(mDNS 推荐值)
+	rec = append(rec, byte(len(rdata)>>8), byte(len(rdata)&0xff))
+	rec = append(rec, rdata...)
+	return rec
+}
+
+// encodeLabels 把 ["a","b"] 编码成 DNS 标签格式: 1a1b0
+func encodeLabels(parts []string) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, byte(len(p)))
+		out = append(out, []byte(p)...)
+	}
+	out = append(out, 0x00)
+	return out
+}
+
+// splitLabels 按非字母数字切分名字成多个标签(中文按整段处理)
+func splitLabels(s string) []string {
+	return []string{s}
+}
+
+// =====================================================
+// 投屏服务
+// =====================================================
+
 func statsPrinter() {
 	for {
 		time.Sleep(5 * time.Second)
@@ -205,7 +300,6 @@ func durStr(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
-// serveClient 处理一个 pad 的连接
 func serveClient(conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 
@@ -213,14 +307,13 @@ func serveClient(conn net.Conn) {
 	currentMu.Lock()
 	if currentCancel != nil {
 		fmt.Printf("🔄 新 pad 连接(%s),断开当前投屏(%s)\n", addr, currentPadAddr)
-		currentCancel() // 终止旧的投屏会话
+		currentCancel()
 	}
 	ctxCancel := make(chan struct{})
 	currentCancel = func() { close(ctxCancel) }
 	currentPadAddr = addr
 	currentMu.Unlock()
 
-	// 退出时清理自己
 	defer func() {
 		currentMu.Lock()
 		if currentPadAddr == addr {
@@ -234,7 +327,6 @@ func serveClient(conn net.Conn) {
 
 	fmt.Printf("📱 pad 已连接:%s\n", addr)
 
-	// 1. 先读 8 字节分辨率头
 	header := make([]byte, 8)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		fmt.Printf("[%s] 未发送分辨率头:%v\n", addr, err)
@@ -244,7 +336,6 @@ func serveClient(conn net.Conn) {
 	height := binary.BigEndian.Uint32(header[4:8])
 	fmt.Printf("[%s] 收到分辨率:%dx%d\n", addr, width, height)
 
-	// 2. 找 ffplay
 	ffplayPath := findFFplay()
 	if ffplayPath == "" {
 		fmt.Println("❌ 找不到 ffplay.exe!")
@@ -252,9 +343,8 @@ func serveClient(conn net.Conn) {
 		return
 	}
 
-	// 3. 启动 ffplay:-fs 全屏,-flags low_delay 低延迟
 	cmd := exec.Command(ffplayPath,
-		"-fs", // 启动即全屏(full screen)
+		"-fs",
 		"-flags", "low_delay",
 		"-fflags", "nobuffer",
 		"-framedrop",
@@ -281,7 +371,6 @@ func serveClient(conn net.Conn) {
 	fmt.Printf("[%s] ffplay 已启动(全屏),等待画面…\n", addr)
 	stats.reset()
 
-	// 4. 持续把 pad 发来的数据喂给 ffplay,同时统计流量
 	go func() {
 		buf := make([]byte, 65536)
 		for {
@@ -298,25 +387,36 @@ func serveClient(conn net.Conn) {
 		}
 	}()
 
-	// 等待会话被取消(被新连接顶掉),或 ffplay 自然结束
 	cmdDone := make(chan error, 1)
 	go func() { cmdDone <- cmd.Wait() }()
 	select {
 	case <-ctxCancel:
-		// 被新连接顶掉,杀掉 ffplay
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
 		fmt.Printf("[%s] 投屏被新连接顶掉\n", addr)
 	case <-cmdDone:
-		// ffplay 被用户关闭或异常退出
 	}
 	stdin.Close()
 }
 
-// findFFplay 先找同目录下的 ffplay.exe,找不到再查 PATH
+func getLocalIPv4s() []string {
+	var ips []string
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ips
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				ips = append(ips, ipnet.IP.String())
+			}
+		}
+	}
+	return ips
+}
+
 func findFFplay() string {
-	// 1. 同目录
 	if exe, err := os.Executable(); err == nil {
 		dir := exe[:len(exe)-len("\\投屏接收端.exe")]
 		candidate := dir + "\\ffplay.exe"
@@ -327,7 +427,6 @@ func findFFplay() string {
 			return "ffplay.exe"
 		}
 	}
-	// 2. PATH
 	if p, err := exec.LookPath("ffplay"); err == nil {
 		return p
 	}
