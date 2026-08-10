@@ -75,36 +75,46 @@ func serveClient(conn net.Conn) {
 	height := binary.BigEndian.Uint32(header[4:8])
 	fmt.Printf("[%s] 收到分辨率:%dx%d\n", addr, width, height)
 
-	// 2. 找 ffmpeg(先同目录,再 PATH)
-	ffmpegPath := findFFmpeg()
-	if ffmpegPath == "" {
-		fmt.Println("❌ 找不到 ffmpeg.exe!请把 ffmpeg.exe 放到本程序同目录,或加入 PATH。")
+	// 2. 找 ffplay(ffmpeg 套件自带的播放器,自带显示窗口)
+	// 不用 ffmpeg 的 sdl 输出(很多社区构建版去掉了 sdl 输出设备)
+	ffplayPath := findFFplay()
+	if ffplayPath == "" {
+		fmt.Println("❌ 找不到 ffplay.exe!")
+		fmt.Println("   请到你下载的 ffmpeg 压缩包的 bin 目录,把 ffplay.exe 拷到本程序同目录。")
 		return
 	}
 
-	// 3. 启动 ffmpeg:从 stdin 收 H.264,解码后用 SDL 窗口显示
-	// 注意:新版 ffmpeg 的 h264 raw demuxer 不再支持 -video_size,分辨率解码器会自己从流里读
-	cmd := exec.Command(ffmpegPath,
+	// 3. 启动 ffplay:从 stdin 收 H.264,自动解码 + 显示窗口
+	// 参数说明:
+	//   -flags low_delay / -fflags nobuffer : 低延迟,出画面快
+	//   -framedrop : 画面跟不上时丢帧保流畅
+	//   -probesize / analyzeduration : 最小探测,首帧尽快出
+	//   -window_title : 窗口标题
+	cmd := exec.Command(ffplayPath,
+		"-flags", "low_delay",
+		"-fflags", "nobuffer",
+		"-framedrop",
 		"-probesize", "32",
 		"-analyzeduration", "0",
 		"-f", "h264",
 		"-i", "pipe:0",
-		"-pix_fmt", "yuv420p",
-		"-f", "sdl", "智慧投屏 - 黑板端",
+		"-window_title", "智慧投屏 - 黑板端",
+		"-x", "800", // 窗口初始宽高(可拖拽调整,双击全屏)
+		"-y", "1280",
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		fmt.Printf("[%s] 启动 ffmpeg 失败:%v\n", addr, err)
+		fmt.Printf("[%s] 启动 ffplay 失败:%v\n", addr, err)
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("[%s] 启动 ffmpeg 失败:%v(请确认 ffmpeg.exe 可用)\n", addr, err)
+		fmt.Printf("[%s] 启动 ffplay 失败:%v(请确认 ffplay.exe 可用)\n", addr, err)
 		return
 	}
-	fmt.Printf("[%s] ffmpeg 已启动,等待画面…\n", addr)
+	fmt.Printf("[%s] ffplay 已启动,等待画面…\n", addr)
 
 	// 4. 持续把 pad 发来的数据喂给 ffmpeg
 	var wg sync.WaitGroup
@@ -130,22 +140,22 @@ func serveClient(conn net.Conn) {
 	cmd.Wait()
 }
 
-// findFFmpeg 先找同目录下的 ffmpeg.exe,找不到再查 PATH
-func findFFmpeg() string {
+// findFFplay 先找同目录下的 ffplay.exe,找不到再查 PATH
+func findFFplay() string {
 	// 1. 同目录
 	if exe, err := os.Executable(); err == nil {
 		dir := exe[:len(exe)-len("\\投屏接收端.exe")]
-		candidate := dir + "\\ffmpeg.exe"
+		candidate := dir + "\\ffplay.exe"
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
 		// 退化:工作目录
-		if _, err := os.Stat("ffmpeg.exe"); err == nil {
-			return "ffmpeg.exe"
+		if _, err := os.Stat("ffplay.exe"); err == nil {
+			return "ffplay.exe"
 		}
 	}
 	// 2. PATH
-	if p, err := exec.LookPath("ffmpeg"); err == nil {
+	if p, err := exec.LookPath("ffplay"); err == nil {
 		return p
 	}
 	return ""
