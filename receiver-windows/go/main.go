@@ -351,9 +351,17 @@ func getLocalIPv4s() []string {
 	}
 	for _, a := range addrs {
 		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				ips = append(ips, ipnet.IP.String())
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
 			}
+			// 过滤掉无效地址:
+			//   169.254.x.x —— APIPA 自动私有地址(未连网网卡自动分配的,不可用)
+			//   这样只广播真正能用的 IP(如 WiFi 的 192.168.x.x)
+			if ip4[0] == 169 && ip4[1] == 254 {
+				continue
+			}
+			ips = append(ips, ip4.String())
 		}
 	}
 	return ips
