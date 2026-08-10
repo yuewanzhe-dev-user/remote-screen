@@ -117,13 +117,15 @@ class BoardDiscovery(private val context: Context) {
     private fun isOwnAddress(ip: String): Boolean {
         return try {
             val interfaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
-            outer@ for (ni in interfaces) {
-                val addrs = ni.inetAddresses
-                while (addrs.hasMoreElements()) {
-                    val hostAddr = addrs.nextElement().hostAddress ?: continue
+            // Enumeration 不能用 for-in,用 Collections.list 转成 List
+            val list = java.util.Collections.list(interfaces)
+            for (ni in list) {
+                val addrs = java.util.Collections.list(ni.inetAddresses)
+                for (addr in addrs) {
+                    val hostAddr = addr.hostAddress ?: continue
                     // 去掉 IPv6 的 scope id(如 fe80::1%wlan0)
                     val pure = hostAddr.substringBefore("%")
-                    if (pure == ip) return@outer@ true
+                    if (pure == ip) return true
                 }
             }
             false
