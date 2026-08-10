@@ -148,6 +148,11 @@ class ScreenCastService : Service() {
             0, inputSurface, null, null
         )
 
+        // 编码器只 start 一次,独立于网络连接。
+        // 这样网络重连时不会重复 start(否则会报错或丢帧),
+        // 也不会因为重连失败导致编码器永远没启动(0 帧问题)。
+        encoder!!.start()
+
         running = true
         updateStatus("正在连接 $targetHost…")
         streamThread = thread(name = "smartcast-stream") {
@@ -159,11 +164,15 @@ class ScreenCastService : Service() {
      * 带重连的推流主循环。
      * 网络断开后,自动重建 socket 重推,最多重试 MAX_RECONNECT 次。
      * 抓屏/编码不停,只重连传输通道,体验上学生无感。
+     *
+     * 注意:如果连接成功后很快(3秒内)就断了,多半是被另一个 pad 顶掉,
+     * 这种情况不重连(否则会和另一个 pad 互相顶替,死循环)。
      */
     private fun streamLoopWithReconnect() {
         var retryCount = 0
         while (running) {
             var out: OutputStream? = null
+            val connectTime = System.currentTimeMillis()
             try {
                 updateStatus("连接中…")
                 socket = Socket()
@@ -179,11 +188,11 @@ class ScreenCastService : Service() {
                 out.write(header)
                 out.flush()
 
+                // 编码器已在 startCasting() 中启动,这里不重复 start
                 val codec = encoder!!
-                if (retryCount == 0) codec.start()
 
                 // 首帧请求:通过 PARAMETER_KEY_REQUEST_SYNC_FLAG 让下一帧为关键帧
-                // (仅在重连后或首帧时触发,确保黑板端尽快解码出画面)
+                // (每次连接后都请求一次,确保黑板端尽快解码出画面)
                 requestKeyFrame()
 
                 val bufferInfo = MediaCodec.BufferInfo()
@@ -209,6 +218,14 @@ class ScreenCastService : Service() {
                 Log.w(TAG, "推流异常: ${e.message}")
                 connected = false
                 if (running) {
+                    // 连接后 3 秒内断开,基本是被另一个 pad 顶掉了(网络抖动不会这么快)。
+                    // 这种情况不重连,避免两个 pad 互相顶替形成死循环。
+                    val aliveMs = System.currentTimeMillis() - connectTime
+                    if (aliveMs < 3000) {
+                        updateStatus("已被其他投屏替换")
+                        Log.w(TAG, "连接仅存活 ${aliveMs}ms,判定为被顶替,停止重连")
+                        break
+                    }
                     retryCount++
                     if (retryCount > MAX_RECONNECT) {
                         updateStatus("重连失败,请检查网络后重试")
