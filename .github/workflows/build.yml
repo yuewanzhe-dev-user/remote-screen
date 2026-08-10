@@ -57,6 +57,10 @@ jobs:
         with:
           go-version: '1.21'
 
+      - name: 下载 Go 依赖
+        working-directory: receiver-windows/go
+        run: go mod download
+
       - name: 交叉编译为 Windows EXE(无需本机有 Go)
         working-directory: receiver-windows/go
         env:
