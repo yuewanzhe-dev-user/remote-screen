@@ -191,8 +191,8 @@ func respondDiscoveryQueries(conn *net.UDPConn, port int, ips []string) {
 			isQuery = true
 		}
 		if isQuery {
-			// 单播回应 pad
-			resp := discoveryMsg{Name: boardName, Port: port, IP: ips[0]}
+			// 单播回应 pad(IP 留空,pad 用来源地址)
+			resp := discoveryMsg{Name: boardName, Port: port}
 			data, _ := json.Marshal(resp)
 			conn.WriteToUDP(data, remote)
 		}
@@ -200,17 +200,32 @@ func respondDiscoveryQueries(conn *net.UDPConn, port int, ips []string) {
 }
 
 // broadcastLoop 每 2 秒向 255.255.255.255:19999 广播一次服务宣告
+//
+// 关键:从每个本机 IP 各发一次广播。
+// 因为 UDP 包的来源地址 = 发送 socket 绑定的本地地址,
+// pad 端用这个来源地址连接黑板。如果只从一个网卡发,
+// 可能选到 pad 不可达的网卡(如手动设了静态 IP 的有线网卡)。
+// 每个网卡都发一次,pad 就能收到来自各个网卡的包,
+// 其中和 pad 同网段的那个(WLAN)来源地址是 pad 能真正连上的。
+// 多个来源地址在 pad 端会合并(同一个黑板名只保留最后收到的)。
 func broadcastLoop(port int, ips []string) {
 	bcastAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("255.255.255.255:%d", discoveryPort))
 	if err != nil {
 		return
 	}
 	for {
-		msg := discoveryMsg{Name: boardName, Port: port, IP: ips[0]}
+		msg := discoveryMsg{Name: boardName, Port: port} // IP 留空,pad 用来源地址
 		data, _ := json.Marshal(msg)
-		// 每次新建 socket 发广播(简单可靠)
-		conn, err := net.DialUDP("udp4", nil, bcastAddr)
-		if err == nil {
+		// 对每个本机 IP,绑定该 IP 建立 socket 发广播
+		for _, ip := range ips {
+			localAddr, err := net.ResolveUDPAddr("udp4", ip+":0")
+			if err != nil {
+				continue
+			}
+			conn, err := net.DialUDP("udp4", localAddr, bcastAddr)
+			if err != nil {
+				continue
+			}
 			conn.Write(data)
 			conn.Close()
 		}
