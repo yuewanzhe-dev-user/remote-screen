@@ -98,6 +98,11 @@ class BoardDiscovery(private val context: Context) {
     private fun handlePacket(text: String, fromIp: String) {
         try {
             val json = JSONObject(text)
+            // 只处理带 name 字段的包(黑板宣告)。
+            // 不带 name 只有 cmd 的包是其他 pad 发的查询,忽略,避免互相误识别成黑板
+            if (!json.has("name")) {
+                return
+            }
             val name = json.optString("name", "未知黑板")
             val port = json.optInt("port", 8888)
             // host 优先用 JSON 里的,兜底用来源 IP
