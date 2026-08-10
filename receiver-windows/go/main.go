@@ -46,10 +46,18 @@ const (
 
 var (
 	currentMu      sync.Mutex
-	currentCancel  func()
-	currentPadAddr string
+	currentCancel  func()  // 终止当前投屏会话的函数
+	currentPadAddr string  // 当前投屏的 pad 地址
 	stats          = &streamStats{}
 	broadcastOK    = false
+)
+
+// 投屏会话管理:用唯一 sessionID 解决并发顶替时的状态错乱
+// 每个 serveClient 持有自己的 sessionID,顶替时只认"当前活动 sessionID"是否还是自己
+var (
+	sessionMu  sync.Mutex
+	activeSession int64  // 当前活动会话 ID(0 表示无会话)
+	localIPs  []string    // 本机有效 IP 缓存
 )
 
 type streamStats struct {
@@ -110,6 +118,12 @@ func main() {
 		fmt.Println("ℹ️ 广播服务未启动,pad 需手输 IP 投屏")
 	}
 
+	// 显示本机可用 IP(方便老师手输兜底)
+	ips := getLocalIPv4s()
+	if len(ips) > 0 {
+		fmt.Printf("📋 本机 IP:%s(手输投屏用这个)\n", ips[0])
+	}
+
 	ln, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
 		fmt.Printf("❌ 监听失败:%v(检查端口 %d 是否被占用)\n", err, port)
@@ -121,7 +135,11 @@ func main() {
 	go statsPrinter()
 
 	fmt.Println("================================================")
-	fmt.Printf("✅ 黑板端已启动,监听 0.0.0.0:%d,等待 pad 连接…\n", port)
+	if len(ips) > 0 {
+		fmt.Printf("✅ 黑板端已启动,监听 %s:%d,等待 pad 连接…\n", ips[0], port)
+	} else {
+		fmt.Printf("✅ 黑板端已启动,监听 0.0.0.0:%d,等待 pad 连接…\n", port)
+	}
 	fmt.Println("提示:关闭本窗口或按 Ctrl+C 退出")
 	fmt.Println("================================================")
 
@@ -261,25 +279,38 @@ func durStr(d time.Duration) string {
 func serveClient(conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 
+	// 分配本会话唯一 ID,用于在退出时判断"我还是不是当前活动会话"
+	sessionMu.Lock()
+	activeSession++
+	mySession := activeSession
+	sessionMu.Unlock()
+
 	// === 多 pad 冲突处理:新连接顶掉旧的 ===
+	// 用 currentCancel 通道通知旧会话退出
 	currentMu.Lock()
-	if currentCancel != nil {
+	if currentPadAddr != "" {
 		fmt.Printf("🔄 新 pad 连接(%s),断开当前投屏(%s)\n", addr, currentPadAddr)
-		currentCancel()
+		if currentCancel != nil {
+			currentCancel() // 通知旧会话退出
+		}
 	}
 	ctxCancel := make(chan struct{})
 	currentCancel = func() { close(ctxCancel) }
 	currentPadAddr = addr
 	currentMu.Unlock()
 
+	// 等一小会儿让旧 ffplay 退出(避免两个 ffplay 抢同一个画面)
+	time.Sleep(300 * time.Millisecond)
+
 	defer func() {
+		conn.Close()
+		// 只有当我还是当前活动会话时,才清理全局状态
 		currentMu.Lock()
 		if currentPadAddr == addr {
 			currentPadAddr = ""
 			currentCancel = nil
 		}
 		currentMu.Unlock()
-		conn.Close()
 		fmt.Printf("📱 %s 断开\n", addr)
 	}()
 
@@ -301,8 +332,10 @@ func serveClient(conn net.Conn) {
 		return
 	}
 
+	// 不用 -fs(全屏会占满屏幕、没有标题栏,无法最小化)
+	// 改用普通窗口模式,带标题栏的最小化/最大化/关闭按钮
+	// 通过 -x -y 设置较大的初始尺寸,老师可手动最大化或调整
 	cmd := exec.Command(ffplayPath,
-		"-fs",
 		"-flags", "low_delay",
 		"-fflags", "nobuffer",
 		"-framedrop",
@@ -311,6 +344,8 @@ func serveClient(conn net.Conn) {
 		"-f", "h264",
 		"-i", "pipe:0",
 		"-window_title", "智慧投屏 - 黑板端",
+		"-x", "1280",
+		"-y", "720",
 		"-left", "0",
 		"-top", "0",
 	)
@@ -329,7 +364,10 @@ func serveClient(conn net.Conn) {
 	fmt.Printf("[%s] ffplay 已启动(全屏),等待画面…\n", addr)
 	stats.reset()
 
+	// 读取 pad 数据并喂给 ffplay 的 goroutine
+	doneReading := make(chan struct{})
 	go func() {
+		defer close(doneReading)
 		buf := make([]byte, 65536)
 		for {
 			n, err := conn.Read(buf)
@@ -345,17 +383,28 @@ func serveClient(conn net.Conn) {
 		}
 	}()
 
+	// 等待:被新连接顶掉 / pad 主动断开 / ffplay 被关
 	cmdDone := make(chan error, 1)
 	go func() { cmdDone <- cmd.Wait() }()
+
 	select {
 	case <-ctxCancel:
+		// 被新连接顶掉
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
 		fmt.Printf("[%s] 投屏被新连接顶掉\n", addr)
+	case <-doneReading:
+		// pad 断开了,杀掉 ffplay
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		fmt.Printf("[%s] pad 断开连接\n", addr)
 	case <-cmdDone:
+		// ffplay 被用户关闭
 	}
 	stdin.Close()
+	cmd.Wait()
 }
 
 func getLocalIPv4s() []string {
