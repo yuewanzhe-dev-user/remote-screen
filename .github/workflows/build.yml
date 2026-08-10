@@ -1,0 +1,66 @@
+name: 构建 pad 端 APK 和黑板端 EXE
+
+# 触发:push 到 master/main,或网页手动 Run workflow
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  # ============ 任务一:编译 pad 端 Android APK ============
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 设置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: 生成 Gradle Wrapper
+        working-directory: sender-android
+        run: gradle wrapper --gradle-version 8.5
+
+      - name: 编译 Release APK
+        working-directory: sender-android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: 智慧投屏-pad端-apk
+          path: sender-android/app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+  # ============ 任务二:编译黑板端 Windows EXE ============
+  build-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: 交叉编译为 Windows EXE(无需本机有 Go)
+        working-directory: receiver-windows/go
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o 投屏接收端.exe main.go
+
+      - name: 上传 EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: 智慧投屏-黑板端-exe
+          path: receiver-windows/go/投屏接收端.exe
+          retention-days: 30

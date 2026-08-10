@@ -1,0 +1,24 @@
+# === Android 构建产物 ===
+sender-android/.gradle/
+sender-android/build/
+sender-android/app/build/
+sender-android/local.properties
+sender-android/**/*.iml
+sender-android/gradle/wrapper/gradle-wrapper.jar
+
+# === Go 构建产物 ===
+receiver-windows/go/*.exe
+receiver-windows/go/vendor/
+
+# === Python ===
+__pycache__/
+*.pyc
+
+# === IDE / 编辑器 ===
+.idea/
+.vscode/
+*.swp
+
+# === 系统 ===
+.DS_Store
+Thumbs.db

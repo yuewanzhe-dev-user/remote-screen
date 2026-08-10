@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="智慧投屏 Step1"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="32dp" />
+
+    <!-- 黑板 IP(写死先用,Step2 换成 mDNS 自动发现) -->
+    <EditText
+        android:id="@+id/etBoardIp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="黑板 IP(如 192.168.1.100)"
+        android:inputType="text"
+        android:text="192.168.1.100" />
+
+    <EditText
+        android:id="@+id/etBoardPort"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="端口"
+        android:inputType="number"
+        android:text="8888"
+        android:layout_marginTop="8dp" />
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="开始投屏"
+        android:layout_marginTop="24dp" />
+
+    <Button
+        android:id="@+id/btnStop"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="停止投屏"
+        android:enabled="false"
+        android:layout_marginTop="8dp" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="状态:未连接"
+        android:layout_marginTop="24dp" />
+
+</LinearLayout>
