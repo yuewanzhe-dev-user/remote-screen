@@ -167,6 +167,17 @@ class RtcClient(
                     updateStatus("浏览器已断开,等待重新打开…")
                     executor.execute { releasePeerOnly() }
                 }
+                "kicked" -> {
+                    // 被其他 pad 顶替:停止推流,不再重连
+                    Log.w(TAG, "被其他设备顶替投屏")
+                    running = false
+                    updateStatus("已被其他设备投屏替换")
+                    executor.execute {
+                        releasePeerAndCapture()
+                        try { wsClient?.close() } catch (_: Exception) {}
+                        wsClient = null
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "解析信令消息失败: $raw")
