@@ -13,6 +13,8 @@ import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.RtpParameters
+import org.webrtc.RtpSender
 import org.webrtc.ScreenCapturerAndroid
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
@@ -20,22 +22,23 @@ import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import java.net.URI
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * WebRTC 投屏客户端。
  *
  * 职责:
  *   1. 连信令服务器(WebSocket),加入房间
- *   2. 收到浏览器连接(joined 且 peerOnline=true)时,createOffer 发给浏览器
- *   3. 用 ScreenCapturerAndroid 抓屏,封装成 VideoTrack
- *   4. 浏览器回 answer → setRemoteDescription
- *   5. ICE candidate 双向交换
+ *   2. 浏览器在线时 createOffer
+ *   3. ScreenCapturerAndroid 抓屏 → VideoTrack
+ *   4. answer / ICE 交换
  *
- * 线程模型:
- *   - 信令(WebSocket)跑在 Java-WebSocket 自己的线程
- *   - WebRTC 的 SDP/ICE 回调跑在 PeerConnection 的内部线程
- *   - 主线程只用来更新 UI(通过 onStatus 回调)
- *   用一个单线程执行器把这些串起来,避免并发问题
+ * 关键优化点:
+ *   - addTrack 必须带 streamId,否则浏览器 e.streams 为空 → 黑屏
+ *   - SDP 里把 H264 提到最前(投屏走硬编更稳)
+ *   - RtpSender 限码率/帧率,DegradationPreference=MAINTAIN_RESOLUTION
+ *   - 浏览器离开后重建 PeerConnection,避免半残 renegotiation
  */
 class RtcClient(
     private val context: Context,
@@ -46,10 +49,12 @@ class RtcClient(
 ) {
     companion object {
         private const val TAG = "RtcClient"
+        private const val STREAM_ID = "smartcast-stream"
         private const val VIDEO_TRACK_ID = "smartcast-video"
-        private const val WIDTH = 1280   // 编码分辨率上限(平衡画质/性能)
-        private const val HEIGHT = 720
-        private const val FPS = 20       // 投屏不需要高帧率,20 够用且省带宽
+        private const val FPS = 20
+        // 投屏码率:局域网 2.5Mbps 够 720p 清晰,再高浪费带宽
+        private const val MAX_BITRATE_BPS = 2_500_000
+        private const val PREFERRED_CODEC = "H264"
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -60,31 +65,32 @@ class RtcClient(
     private var videoSource: VideoSource? = null
     private var videoTrack: VideoTrack? = null
     private var surfaceHelper: SurfaceTextureHelper? = null
+    private var videoSender: RtpSender? = null
+
+    private var captureWidth = 1280
+    private var captureHeight = 720
 
     private var wsClient: WebSocketClient? = null
     @Volatile private var running = false
+    /** 防止 createOffer 并发(peer-online + joined 同时触发) */
+    private val offering = AtomicBoolean(false)
+    private val offerSeq = AtomicInteger(0)
 
-    /**
-     * 启动:连信令 → 初始化 WebRTC → 等浏览器配对。
-     * 必须在主线程调用(内部会切到 executor)。
-     */
     fun start() {
         running = true
         connectSignaling()
     }
 
-    /** 停止并释放所有资源 */
     fun stop() {
         running = false
         executor.execute {
-            try { videoCapturer?.stopCapture() } catch (_: Exception) {}
-            try { videoTrack?.dispose() } catch (_: Exception) {}
-            try { videoSource?.dispose() } catch (_: Exception) {}
-            try { surfaceHelper?.dispose() } catch (_: Exception) {}
-            try { peerConnection?.dispose() } catch (_: Exception) {}
+            releasePeerAndCapture()
             try { factory?.dispose() } catch (_: Exception) {}
+            factory = null
             try { eglBase?.release() } catch (_: Exception) {}
+            eglBase = null
             try { wsClient?.close() } catch (_: Exception) {}
+            wsClient = null
             Log.i(TAG, "已释放所有资源")
         }
         executor.shutdown()
@@ -101,8 +107,7 @@ class RtcClient(
             override fun onOpen(handshake: ServerHandshake?) {
                 Log.i(TAG, "信令 WebSocket 已连接")
                 updateStatus("已连信令,等待浏览器打开…")
-                // WebSocket 连上后,初始化 WebRTC(只初始化一次,等浏览器来就 offer)
-                initWebRTC()
+                initFactoryOnce()
             }
 
             override fun onMessage(message: String?) {
@@ -122,58 +127,45 @@ class RtcClient(
                 Log.e(TAG, "信令错误: ${e?.message}")
             }
         }
-        wsClient?.setConnectionLostTimeout(0) // 0=不启用自动断开检测,我们自己管理重连
+        wsClient?.setConnectionLostTimeout(0)
         wsClient?.connect()
     }
 
     private fun handleSignalingMessage(raw: String) {
         try {
-            // 用 org.json(避免引 gson),信令消息都是简单 JSON
             val json = org.json.JSONObject(raw)
-            val type = json.optString("type")
-            when (type) {
+            when (json.optString("type")) {
                 "joined" -> {
-                    // 服务器告知已加入房间,peerOnline=true 表示浏览器已在线
                     val peerOnline = json.optBoolean("peerOnline")
                     Log.i(TAG, "已加入房间,浏览器在线:$peerOnline")
-                    if (peerOnline) {
-                        // pad 后连:浏览器在等我们的 offer,立即发起
-                        createOffer()
-                    } else {
-                        updateStatus("已连信令,等待浏览器打开…")
-                    }
+                    if (peerOnline) createOffer()
+                    else updateStatus("已连信令,等待浏览器打开…")
                 }
                 "peer-online" -> {
-                    // pad 先连时,浏览器后进来,服务器通知我们"对方上线了"
-                    // 这时 pad 要主动 createOffer(否则死锁:浏览器等 offer,pad 等浏览器)
                     Log.i(TAG, "浏览器已上线,发起 offer")
                     createOffer()
                 }
                 "answer" -> {
-                    // 浏览器回的 answer
-                    val sdp = json.optJSONObject("data")
-                    if (sdp != null) {
-                        val desc = SessionDescription(
-                            SessionDescription.Type.ANSWER,
-                            sdp.optString("sdp")
-                        )
-                        executor.execute { setRemoteAnswer(desc) }
-                    }
+                    val sdp = json.optJSONObject("data") ?: return
+                    val desc = SessionDescription(
+                        SessionDescription.Type.ANSWER,
+                        sdp.optString("sdp")
+                    )
+                    executor.execute { setRemoteAnswer(desc) }
                 }
                 "ice" -> {
-                    val cand = json.optJSONObject("data")
-                    if (cand != null) {
-                        val candidate = IceCandidate(
-                            cand.optString("sdpMid"),
-                            cand.optInt("sdpMLineIndex"),
-                            cand.optString("candidate")
-                        )
-                        executor.execute { peerConnection?.addIceCandidate(candidate) }
-                    }
+                    val cand = json.optJSONObject("data") ?: return
+                    val candidate = IceCandidate(
+                        cand.optString("sdpMid"),
+                        cand.optInt("sdpMLineIndex"),
+                        cand.optString("candidate")
+                    )
+                    executor.execute { peerConnection?.addIceCandidate(candidate) }
                 }
                 "peer-left" -> {
-                    Log.i(TAG, "浏览器离开了")
+                    Log.i(TAG, "浏览器离开了,仅关闭 PeerConnection(保留抓屏,MediaProjection 授权只能用一次)")
                     updateStatus("浏览器已断开,等待重新打开…")
+                    executor.execute { releasePeerOnly() }
                 }
             }
         } catch (e: Exception) {
@@ -191,51 +183,70 @@ class RtcClient(
 
     // ===================== WebRTC =====================
 
-    private fun initWebRTC() {
-        executor.execute {
-            if (factory != null) return@execute // 已初始化
-            try {
-                // 1. 初始化 PeerConnectionFactory(全局一次)
-                PeerConnectionFactory.initialize(
-                    PeerConnectionFactory.InitializationOptions.builder(context)
-                        .setEnableInternalTracer(false)
-                        .createInitializationOptions()
+    /** 必须在 executor 线程调用 */
+    private fun ensureFactory(): Boolean {
+        if (factory != null) return true
+        return try {
+            PeerConnectionFactory.initialize(
+                PeerConnectionFactory.InitializationOptions.builder(context)
+                    .setEnableInternalTracer(false)
+                    .createInitializationOptions()
+            )
+            eglBase = EglBase.create()
+            // enableIntelVp8Encoder=true, enableH264HighProfile=true
+            factory = PeerConnectionFactory.builder()
+                .setVideoEncoderFactory(
+                    DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
                 )
+                .setVideoDecoderFactory(
+                    DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
+                )
+                .createPeerConnectionFactory()
+            Log.i(TAG, "PeerConnectionFactory 初始化完成")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Factory 初始化失败: ${e.message}", e)
+            updateStatus("初始化失败:${e.message}")
+            false
+        }
+    }
 
-                eglBase = EglBase.create()
+    private fun initFactoryOnce() {
+        executor.execute { ensureFactory() }
+    }
 
-                // 2. 创建 Factory,带 H.264 编解码器
-                factory = PeerConnectionFactory.builder()
-                    .setVideoEncoderFactory(
-                        DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true)
-                    )
-                    .setVideoDecoderFactory(
-                        DefaultVideoDecoderFactory(eglBase!!.eglBaseContext)
-                    )
-                    .createPeerConnectionFactory()
+    /** 创建(或重建) PeerConnection;抓屏尽量复用。必须在 executor 线程调用 */
+    private fun ensurePeerReady(): Boolean {
+        if (!ensureFactory()) return false
+        if (peerConnection != null && videoTrack != null) return true
 
-                // 3. 创建 PeerConnection(局域网不用 STUN/TURN)
-                val iceServers = emptyList<PeerConnection.IceServer>()
-                val config = PeerConnection.RTCConfiguration(iceServers).apply {
-                    sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-                    // 局域网 host candidate 即可,关掉额外的 ICE 候选收集加速
-                    iceTransportsType = PeerConnection.IceTransportsType.ALL
-                }
-                peerConnection = factory!!.createPeerConnection(config, pcObserver)
-
-                // 4. 创建抓屏 + VideoTrack,加到 PeerConnection
-                createVideoTrack()
-
-                Log.i(TAG, "WebRTC 初始化完成")
-            } catch (e: Exception) {
-                Log.e(TAG, "WebRTC 初始化失败: ${e.message}", e)
-                updateStatus("初始化失败:${e.message}")
+        try {
+            val iceServers = emptyList<PeerConnection.IceServer>()
+            val config = PeerConnection.RTCConfiguration(iceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                iceTransportsType = PeerConnection.IceTransportsType.ALL
+                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
             }
+            peerConnection = factory!!.createPeerConnection(config, pcObserver)
+
+            if (videoTrack != null) {
+                // 浏览器重连:抓屏还在跑,只把已有 track 重新挂上
+                videoSender = peerConnection!!.addTrack(videoTrack, listOf(STREAM_ID))
+                Log.i(TAG, "复用已有 VideoTrack 挂到新 PeerConnection")
+            } else {
+                createVideoTrack()
+            }
+            applySenderConstraints()
+            Log.i(TAG, "PeerConnection 就绪 ${captureWidth}x${captureHeight}")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "创建 PeerConnection 失败: ${e.message}", e)
+            updateStatus("初始化失败:${e.message}")
+            return false
         }
     }
 
     private fun createVideoTrack() {
-        // ScreenCapturerAndroid:封装 MediaProjection,自动抓屏
         videoCapturer = ScreenCapturerAndroid(
             mediaProjectionPermissionData,
             object : MediaProjection.Callback() {
@@ -246,13 +257,10 @@ class RtcClient(
             }
         )
 
-        // 读屏幕真实分辨率,但限制在 720p 以内(很多设备 H.264 硬编上限是 1080p,
-        // 2560x1600 这种平板分辨率会超出硬编能力,导致编码失败 → ICE 连上但黑屏)
-        val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
+        val wm = context.getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
         val metrics = android.util.DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
-        // 等比缩放到 ≤ 720p
         val maxW = 1280
         val maxH = 720
         var cw = metrics.widthPixels
@@ -262,18 +270,18 @@ class RtcClient(
             cw = (cw * scale).toInt()
             ch = (ch * scale).toInt()
         }
+        // 编码器要求偶数
         if (cw % 2 != 0) cw -= 1
         if (ch % 2 != 0) ch -= 1
-        Log.i(TAG, "屏幕分辨率: ${metrics.widthPixels}x${metrics.heightPixels},抓屏缩放到 ${cw}x${ch}")
+        captureWidth = cw
+        captureHeight = ch
+        Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 抓屏 ${cw}x${ch} @${FPS}fps")
 
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
-        // isScreencast=true:屏幕共享模式
         videoSource = factory!!.createVideoSource(/* isScreencast = */ true)
 
-        // 关键诊断:包装 capturerObserver,统计抓到的帧数
-        // 如果帧数一直是 0,说明 ScreenCapturerAndroid 没抓到画面(MediaProjection 没真正启动)
         val rawObserver = videoSource!!.capturerObserver
-        val frameCounter = java.util.concurrent.atomic.AtomicInteger(0)
+        val frameCounter = AtomicInteger(0)
         val wrappedObserver = object : org.webrtc.CapturerObserver {
             override fun onCapturerStarted(success: Boolean) {
                 Log.i(TAG, "🎯 抓屏已启动 success=$success")
@@ -291,69 +299,163 @@ class RtcClient(
 
         videoCapturer!!.initialize(surfaceHelper, context, wrappedObserver)
         videoCapturer!!.startCapture(cw, ch, FPS)
-        Log.i(TAG, "startCapture 已调用,等待 🎯 抓屏已启动 日志")
 
         videoTrack = factory!!.createVideoTrack(VIDEO_TRACK_ID, videoSource)
         videoTrack!!.setEnabled(true)
-        peerConnection!!.addTrack(videoTrack)
-        Log.i(TAG, "VideoTrack 已创建并加入 PeerConnection")
+        // 屏幕内容优先保细节(文字/UI),告诉编码器别过度糊化
+        try {
+            // ContentHint: 0=NONE 1=FLUID 2=DETAILED(部分版本 API)
+            videoTrack!!.javaClass.getMethod("setContentHint", String::class.java)
+                .invoke(videoTrack, "detail")
+        } catch (_: Exception) {
+            // 旧版 lib 没有此 API,忽略
+        }
+
+        videoSender = peerConnection!!.addTrack(videoTrack, listOf(STREAM_ID))
+        Log.i(TAG, "VideoTrack 已加入 (stream=$STREAM_ID)")
+    }
+
+    /** 限制发送码率/帧率,投屏保分辨率 */
+    private fun applySenderConstraints() {
+        val sender = videoSender ?: return
+        try {
+            val params = sender.parameters
+            if (params.encodings.isNotEmpty()) {
+                val enc = params.encodings[0]
+                enc.maxBitrateBps = MAX_BITRATE_BPS
+                enc.maxFramerate = FPS
+                // 有的版本支持 scaleResolutionDownBy,保持 1.0 不缩放
+                try { enc.scaleResolutionDownBy = 1.0 } catch (_: Exception) {}
+            }
+            try {
+                params.degradationPreference =
+                    RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
+            } catch (_: Exception) {}
+            sender.parameters = params
+            Log.i(TAG, "RtpSender 约束: maxBitrate=${MAX_BITRATE_BPS / 1000}kbps maxFps=$FPS maintainRes")
+        } catch (e: Exception) {
+            Log.w(TAG, "设置 RtpSender 参数失败: ${e.message}")
+        }
     }
 
     private fun createOffer() {
+        if (!offering.compareAndSet(false, true)) {
+            Log.w(TAG, "已有 offer 进行中,跳过")
+            return
+        }
+        val seq = offerSeq.incrementAndGet()
         executor.execute {
-            if (peerConnection == null) {
-                Log.w(TAG, "PeerConnection 未就绪,跳过 createOffer")
-                return@execute
-            }
-            // 只发送视频,不接收
-            val constraints = MediaConstraints().apply {
-                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
-                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
-            }
-            peerConnection!!.createOffer(object : org.webrtc.SdpObserver {
-                override fun onCreateSuccess(desc: SessionDescription) {
-                    // 关键诊断:打印 offer 里协商的视频 codec
-                    // 如果没有 H264 也没有 VP8/VP9,说明编码器没就绪
-                    val sdp = desc.description
-                    val codecs = mutableSetOf<String>()
-                    val rtxmap = Regex("""a=rtpmap:(\d+) ([a-zA-Z0-9-]+)/""")
-                    for (m in rtxmap.findAll(sdp)) {
-                        codecs.add("${m.groupValues[1]}=${m.groupValues[2]}")
+            try {
+                if (!ensurePeerReady()) {
+                    offering.set(false)
+                    return@execute
+                }
+                val pc = peerConnection ?: run {
+                    offering.set(false)
+                    return@execute
+                }
+
+                // 已在 stable 且 ICE 已通时,不重复发 offer(避免无意义 renegotiation)
+                val ice = pc.iceConnectionState()
+                if (pc.signalingState() == PeerConnection.SignalingState.STABLE &&
+                    (ice == PeerConnection.IceConnectionState.CONNECTED ||
+                     ice == PeerConnection.IceConnectionState.COMPLETED)
+                ) {
+                    Log.i(TAG, "已在投屏中,跳过重复 offer#$seq")
+                    offering.set(false)
+                    return@execute
+                }
+
+                val constraints = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "false"))
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "false"))
+                }
+                pc.createOffer(object : org.webrtc.SdpObserver {
+                    override fun onCreateSuccess(desc: SessionDescription) {
+                        // 把 H264 提到 m=video 最前,优先硬编
+                        val preferred = preferCodec(desc.description, PREFERRED_CODEC)
+                        val local = SessionDescription(desc.type, preferred)
+
+                        val codecs = Regex("""a=rtpmap:(\d+) ([A-Za-z0-9-]+)/""")
+                            .findAll(preferred)
+                            .map { "${it.groupValues[1]}=${it.groupValues[2]}" }
+                            .toList()
+                        Log.i(TAG, "📋 offer#$seq codecs(优先序): $codecs")
+
+                        pc.setLocalDescription(object : org.webrtc.SdpObserver {
+                            override fun onCreateSuccess(p0: SessionDescription?) {}
+                            override fun onSetSuccess() {
+                                val json = org.json.JSONObject()
+                                json.put("type", "offer")
+                                val data = org.json.JSONObject()
+                                data.put("type", local.type.canonicalForm())
+                                data.put("sdp", local.description)
+                                json.put("data", data)
+                                sendToSignaling(json)
+                                Log.i(TAG, "已发送 offer#$seq")
+                                updateStatus("已发起连接,等待浏览器响应…")
+                                offering.set(false)
+                            }
+                            override fun onCreateFailure(p0: String?) {}
+                            override fun onSetFailure(error: String?) {
+                                Log.e(TAG, "setLocalDescription 失败: $error")
+                                offering.set(false)
+                            }
+                        }, local)
                     }
-                    Log.i(TAG, "📋 offer 里的 codec: $codecs")
-                    Log.i(TAG, "📋 offer SDP 片段:\n${sdp.take(2000)}")
 
-                    peerConnection!!.setLocalDescription(SimpleSdpObserver(), desc)
-                    // 发 offer 给浏览器
-                    val json = org.json.JSONObject()
-                    json.put("type", "offer")
-                    val data = org.json.JSONObject()
-                    data.put("type", desc.type.canonicalForm())
-                    data.put("sdp", desc.description)
-                    json.put("data", data)
-                    sendToSignaling(json)
-                    Log.i(TAG, "已发送 offer")
-                    updateStatus("已发起连接,等待浏览器响应…")
-                }
-
-                override fun onSetSuccess() {}
-                override fun onSetFailure(error: String?) {}
-                override fun onCreateFailure(error: String?) {
-                    Log.e(TAG, "createOffer 失败: $error")
-                    updateStatus("发起连接失败:$error")
-                }
-            }, constraints)
+                    override fun onSetSuccess() {}
+                    override fun onSetFailure(error: String?) {}
+                    override fun onCreateFailure(error: String?) {
+                        Log.e(TAG, "createOffer 失败: $error")
+                        updateStatus("发起连接失败:$error")
+                        offering.set(false)
+                    }
+                }, constraints)
+            } catch (e: Exception) {
+                Log.e(TAG, "createOffer 异常: ${e.message}", e)
+                offering.set(false)
+            }
         }
     }
 
     private fun setRemoteAnswer(desc: SessionDescription) {
-        peerConnection?.setRemoteDescription(SimpleSdpObserver(), desc)
+        val pc = peerConnection
+        if (pc == null) {
+            Log.w(TAG, "收到 answer 但 PeerConnection 已释放,忽略")
+            return
+        }
+        pc.setRemoteDescription(SimpleSdpObserver("setRemoteAnswer"), desc)
+        // answer 到位后再刷一次发送约束(有的实现 encodings 在协商后才完整)
+        applySenderConstraints()
         Log.i(TAG, "已设置远端 answer,投屏建立中")
+    }
+
+    /** 只关 PeerConnection,保留 MediaProjection 抓屏(授权一次性) */
+    private fun releasePeerOnly() {
+        offering.set(false)
+        videoSender = null
+        try { peerConnection?.close() } catch (_: Exception) {}
+        try { peerConnection?.dispose() } catch (_: Exception) {}
+        peerConnection = null
+        Log.i(TAG, "PeerConnection 已关闭,抓屏继续运行")
+    }
+
+    private fun releasePeerAndCapture() {
+        releasePeerOnly()
+        try { videoCapturer?.stopCapture() } catch (_: Exception) {}
+        try { videoCapturer?.dispose() } catch (_: Exception) {}
+        videoCapturer = null
+        try { videoTrack?.dispose() } catch (_: Exception) {}
+        videoTrack = null
+        try { videoSource?.dispose() } catch (_: Exception) {}
+        videoSource = null
+        try { surfaceHelper?.dispose() } catch (_: Exception) {}
+        surfaceHelper = null
     }
 
     private val pcObserver = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
-            // 把本地 ICE 候选发给浏览器
             val json = org.json.JSONObject()
             json.put("type", "ice")
             val data = org.json.JSONObject()
@@ -367,14 +469,21 @@ class RtcClient(
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
             Log.i(TAG, "ICE 连接状态: $state")
             when (state) {
-                PeerConnection.IceConnectionState.CONNECTED -> updateStatus("投屏中")
+                PeerConnection.IceConnectionState.CONNECTED,
+                PeerConnection.IceConnectionState.COMPLETED -> updateStatus("投屏中")
                 PeerConnection.IceConnectionState.DISCONNECTED -> updateStatus("连接断开,尝试恢复…")
-                PeerConnection.IceConnectionState.FAILED -> updateStatus("连接失败")
+                PeerConnection.IceConnectionState.FAILED -> {
+                    updateStatus("连接失败,等待浏览器重连…")
+                    // 只关 PC,保留抓屏;下次 peer-online 再建新 PC
+                    executor.execute { releasePeerOnly() }
+                }
                 else -> {}
             }
         }
 
-        override fun onSignalingChange(state: PeerConnection.SignalingState?) {}
+        override fun onSignalingChange(state: PeerConnection.SignalingState?) {
+            Log.i(TAG, "Signaling: $state")
+        }
         override fun onIceConnectionReceivingChange(receiving: Boolean) {}
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) {}
         override fun onIceCandidatesRemoved(candidates: Array<out IceCandidate>?) {}
@@ -390,10 +499,43 @@ class RtcClient(
         onStatus(text)
     }
 
-    private class SimpleSdpObserver : org.webrtc.SdpObserver {
+    private class SimpleSdpObserver(private val tag: String = "") : org.webrtc.SdpObserver {
         override fun onCreateSuccess(p0: SessionDescription?) {}
-        override fun onSetSuccess() {}
-        override fun onCreateFailure(p0: String?) {}
-        override fun onSetFailure(p0: String?) {}
+        override fun onSetSuccess() { Log.i(TAG, "SdpObserver[$tag] set ok") }
+        override fun onCreateFailure(p0: String?) { Log.e(TAG, "SdpObserver[$tag] create fail: $p0") }
+        override fun onSetFailure(p0: String?) { Log.e(TAG, "SdpObserver[$tag] set fail: $p0") }
     }
+}
+
+/**
+ * 把指定 codec 的 payload type 挪到 m= 行最前面,提高协商优先级。
+ * 例: m=video 9 ... 96 97 104 → 104 96 97 (H264=104 优先)
+ */
+private fun preferCodec(sdp: String, codec: String): String {
+    val lines = sdp.split("\r\n").toMutableList()
+    val mIndex = lines.indexOfFirst { it.startsWith("m=video") }
+    if (mIndex < 0) return sdp
+
+    // 收集该 codec 的 pt(可能有多个 profile)
+    val pts = mutableListOf<String>()
+    val rtpmap = Regex("""^a=rtpmap:(\d+) ${Regex.escape(codec)}/""", RegexOption.IGNORE_CASE)
+    for (line in lines) {
+        val m = rtpmap.find(line) ?: continue
+        pts.add(m.groupValues[1])
+    }
+    if (pts.isEmpty()) {
+        Log.w("RtcClient", "SDP 中未找到 codec=$codec,保持原序")
+        return sdp
+    }
+
+    val parts = lines[mIndex].split(" ").toMutableList()
+    // m=video port proto pt pt pt...
+    if (parts.size <= 3) return sdp
+    val header = parts.subList(0, 3).toList()
+    val payloads = parts.subList(3, parts.size).toMutableList()
+    val preferred = pts.filter { payloads.contains(it) }
+    payloads.removeAll(preferred.toSet())
+    lines[mIndex] = (header + preferred + payloads).joinToString(" ")
+    Log.i("RtcClient", "SDP 已优先 $codec → pt=$preferred")
+    return lines.joinToString("\r\n")
 }
