@@ -22,3 +22,10 @@ __pycache__/
 # === 系统 ===
 .DS_Store
 Thumbs.db
+
+# === Node(信令服务器本机验证用) ===
+signaling-node/node_modules/
+signaling-node/package-lock.json
+
+# === ZCode 工作目录 ===
+.zcode/
