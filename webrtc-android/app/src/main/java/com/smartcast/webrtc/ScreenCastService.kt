@@ -56,7 +56,7 @@ class ScreenCastService : Service() {
         val server = intent.getStringExtra(EXTRA_SERVER) ?: return START_NOT_STICKY
         val room = intent.getStringExtra(EXTRA_ROOM) ?: return START_NOT_STICKY
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
-        val quality = intent.getStringExtra(EXTRA_QUALITY) ?: "1080"
+        val quality = intent.getStringExtra(EXTRA_QUALITY) ?: "balanced"
 
         startForeground()
 

@@ -12,7 +12,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -21,9 +20,7 @@ import org.json.JSONArray
 
 /**
  * 主界面:自动发现黑板 → 点一下投屏。
- * - 历史投过的黑板置顶
- * - 列表展示教室名(串班区分)
- * - 发现带 token 时自动携带(默认无 token,不影响一键)
+ * 画质由黑板 exe 教师控制,学生端不可改。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -34,19 +31,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStatus: TextView
     private lateinit var lvBoards: ListView
     private lateinit var tvBoardsHint: TextView
+    private lateinit var tvQualityHint: TextView
     private lateinit var layoutAdvanced: LinearLayout
     private lateinit var tvAdvancedToggle: TextView
-    private lateinit var spQuality: Spinner
     private lateinit var prefs: SharedPreferences
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    // 与 Spinner 顺序一致
-    private val qualityKeys = listOf("1080", "720", "native")
-    private val qualityLabels = listOf(
-        "1080p 清晰(推荐)",
-        "720p 流畅",
-        "原分辨率(更吃性能/可能糊或失败)"
-    )
 
     private var discovery: BoardDiscovery? = null
     private var lastBoardNames: List<String>? = null
@@ -58,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private var pendingRoom: String = "default"
     private var pendingToken: String = ""
     private var pendingBoardName: String = ""
+    private var pendingQuality: String = "balanced"
 
     private val projectionManager by lazy {
         getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -85,19 +75,14 @@ class MainActivity : AppCompatActivity() {
         tvStatus = findViewById(R.id.tvStatus)
         lvBoards = findViewById(R.id.lvBoards)
         tvBoardsHint = findViewById(R.id.tvBoardsHint)
+        tvQualityHint = findViewById(R.id.tvQualityHint)
         layoutAdvanced = findViewById(R.id.layoutAdvanced)
         tvAdvancedToggle = findViewById(R.id.tvAdvancedToggle)
-        spQuality = findViewById(R.id.spQuality)
 
         etServer.setText(prefs.getString("server", ""))
         etRoom.setText(prefs.getString("room", "default"))
-
-        spQuality.adapter = ArrayAdapter(
-            this, android.R.layout.simple_spinner_dropdown_item, qualityLabels
-        )
-        val savedQ = prefs.getString("quality", "1080") ?: "1080"
-        val qIndex = qualityKeys.indexOf(savedQ).let { if (it >= 0) it else 0 }
-        spQuality.setSelection(qIndex)
+        pendingQuality = prefs.getString("quality", "balanced") ?: "balanced"
+        tvQualityHint.text = "画质由黑板控制 · 当前 ${qualityLabel(pendingQuality)}"
 
         tvAdvancedToggle.setOnClickListener {
             val show = layoutAdvanced.visibility != View.VISIBLE
@@ -116,6 +101,7 @@ class MainActivity : AppCompatActivity() {
             pendingRoom = room
             pendingToken = prefs.getString("token", "") ?: ""
             pendingBoardName = prefs.getString("last_board_name", "") ?: ""
+            pendingQuality = prefs.getString("quality", "balanced") ?: "balanced"
             prefs.edit().putString("server", server).putString("room", room).apply()
             captureLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
@@ -126,6 +112,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         startBoardDiscovery()
+    }
+
+    private fun qualityLabel(q: String): String = when (q) {
+        "clear" -> "清晰"
+        "smooth" -> "流畅"
+        else -> "均衡"
     }
 
     private fun startBoardDiscovery() {
@@ -161,12 +153,15 @@ class MainActivity : AppCompatActivity() {
                     pendingRoom = board.room.ifEmpty { "default" }
                     pendingToken = board.token
                     pendingBoardName = board.name
+                    pendingQuality = board.quality.ifEmpty { "balanced" }
                     etServer.setText(pendingServer)
                     etRoom.setText(pendingRoom)
+                    tvQualityHint.text = "画质由黑板控制 · ${qualityLabel(pendingQuality)}"
                     prefs.edit()
                         .putString("server", pendingServer)
                         .putString("room", pendingRoom)
                         .putString("token", pendingToken)
+                        .putString("quality", pendingQuality)
                         .putString("last_board_name", board.name)
                         .apply()
                     captureLauncher.launch(projectionManager.createScreenCaptureIntent())
@@ -175,19 +170,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 历史黑板置顶 + 同网段优先 */
     private fun sortBoards(boards: List<BoardDiscovery.Board>): List<BoardDiscovery.Board> {
         val history = loadHistoryNames()
         return boards.sortedWith(
-            compareByDescending<BoardDiscovery.Board> { history.indexOf(it.name).let { i -> if (i >= 0) 1000 - i else -1 } }
-                .thenBy { it.name }
+            compareByDescending<BoardDiscovery.Board> {
+                history.indexOf(it.name).let { i -> if (i >= 0) 1000 - i else -1 }
+            }.thenBy { it.name }
         )
     }
 
     private fun formatBoardLine(b: BoardDiscovery.Board): String {
         val hist = loadHistoryNames()
         val star = if (hist.contains(b.name)) "★ " else ""
-        // 串班区分:名称在前(大字视觉靠排序+★),IP 在后
         return "$star${b.name}  ·  ${b.host}:${b.port}"
     }
 
@@ -227,16 +221,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun selectedQuality(): String {
-        val i = spQuality.selectedItemPosition.coerceIn(0, qualityKeys.lastIndex)
-        return qualityKeys[i]
-    }
-
     private fun startCastService(resultCode: Int, data: Intent) {
         val server = pendingServer.ifEmpty { etServer.text.toString().trim() }
         val room = pendingRoom.ifEmpty { etRoom.text.toString().trim().ifEmpty { "default" } }
         val token = pendingToken
-        val quality = selectedQuality()
+        val quality = pendingQuality.ifEmpty { "balanced" }
         if (server.isEmpty()) {
             Toast.makeText(this, "未选择黑板", Toast.LENGTH_SHORT).show()
             return
@@ -253,7 +242,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(ScreenCastService.EXTRA_QUALITY, quality)
         }
         startForegroundService(intent)
-        updateUi(true, "启动中($quality)…")
+        updateUi(true, "启动中…")
     }
 
     private fun updateUi(casting: Boolean, status: String) {

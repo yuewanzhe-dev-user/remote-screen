@@ -46,20 +46,15 @@
         android:layout_marginTop="12dp"
         android:textSize="14sp" />
 
-    <!-- 画质:主路径可见,方便课堂切清晰度 -->
+    <!-- 画质由黑板 exe 教师控制,学生端不展示切换 -->
     <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="画质(教室 WiFi 建议 1080p;卡顿可降到 720p)"
-        android:textColor="#666"
-        android:textSize="12sp"
-        android:layout_marginTop="8dp" />
-
-    <Spinner
-        android:id="@+id/spQuality"
+        android:id="@+id/tvQualityHint"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="4dp" />
+        android:text="画质由黑板控制(默认均衡)"
+        android:textColor="#888"
+        android:textSize="12sp"
+        android:layout_marginTop="8dp" />
 
     <!-- 高级:搜不到时手输 -->
     <TextView

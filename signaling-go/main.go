@@ -47,12 +47,15 @@ const (
 )
 
 var (
-	boardName   = defaultName
-	boardRoom   = defaultRoom
-	boardPort   = defaultPort
-	boardToken  = "" // 空=不校验;非空=pad/browser 需带相同 token
-	broadcastOK = false
-	logFile     *os.File
+	boardName    = defaultName
+	boardRoom    = defaultRoom
+	boardPort    = defaultPort
+	boardToken   = "" // 空=不校验;非空=pad/browser 需带相同 token
+	// 画质由黑板控制(学生 pad 不可改): balanced|clear|smooth
+	boardQuality = "balanced"
+	qualityMu    sync.RWMutex
+	broadcastOK  = false
+	logFile      *os.File
 
 	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
@@ -103,13 +106,50 @@ type roomState struct {
 }
 
 type discoveryMsg struct {
-	Name  string `json:"name,omitempty"`
-	Port  int    `json:"port,omitempty"`
-	IP    string `json:"ip,omitempty"`
-	Room  string `json:"room,omitempty"`
-	Type  string `json:"type,omitempty"`
-	Token string `json:"token,omitempty"` // 仅在配置了 token 时出现
-	Cmd   string `json:"cmd,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Port    int    `json:"port,omitempty"`
+	IP      string `json:"ip,omitempty"`
+	Room    string `json:"room,omitempty"`
+	Type    string `json:"type,omitempty"`
+	Token   string `json:"token,omitempty"`   // 仅在配置了 token 时出现
+	Quality string `json:"quality,omitempty"` // balanced|clear|smooth,黑板控制
+	Cmd     string `json:"cmd,omitempty"`
+}
+
+func normalizeQuality(q string) string {
+	switch strings.ToLower(strings.TrimSpace(q)) {
+	case "clear", "1080", "1080p", "high":
+		return "clear"
+	case "smooth", "720", "720p", "low":
+		return "smooth"
+	default:
+		return "balanced"
+	}
+}
+
+func getBoardQuality() string {
+	qualityMu.RLock()
+	defer qualityMu.RUnlock()
+	return boardQuality
+}
+
+func setBoardQuality(q string) string {
+	q = normalizeQuality(q)
+	qualityMu.Lock()
+	boardQuality = q
+	qualityMu.Unlock()
+	return q
+}
+
+// 通知房间内 pad 切换画质(教师在 exe 上改)
+func notifyPadQuality(roomName, quality string) {
+	room := getRoom(roomName)
+	if pad := peerClient(room, "pad"); pad != nil {
+		_ = pad.writeJSON(map[string]string{
+			"type":    "quality",
+			"quality": quality,
+		})
+	}
 }
 
 func main() {
@@ -127,6 +167,10 @@ func main() {
 		boardToken = strings.TrimSpace(os.Args[3])
 	} else if t := strings.TrimSpace(os.Getenv("SMARTCAST_TOKEN")); t != "" {
 		boardToken = t
+	}
+	// 画质: 环境变量 SMARTCAST_QUALITY=balanced|clear|smooth
+	if q := strings.TrimSpace(os.Getenv("SMARTCAST_QUALITY")); q != "" {
+		boardQuality = normalizeQuality(q)
 	}
 
 	initLog()
@@ -163,13 +207,51 @@ func main() {
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"name":      boardName,
-			"port":      boardPort,
-			"room":      boardRoom,
-			"type":      "webrtc",
-			"tokenOn":   boardToken != "",
-			"hasPad":    roomHasPad(boardRoom),
-			"ips":       getLocalIPv4s(),
+			"name":    boardName,
+			"port":    boardPort,
+			"room":    boardRoom,
+			"type":    "webrtc",
+			"tokenOn": boardToken != "",
+			"quality": getBoardQuality(),
+			"hasPad":  roomHasPad(boardRoom),
+			"ips":     getLocalIPv4s(),
+		})
+	})
+	// 教师设置画质: GET/POST /api/quality?quality=balanced|clear|smooth
+	mux.HandleFunc("/api/quality", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]string{"quality": getBoardQuality()})
+			return
+		}
+		if r.Method != http.MethodPost && r.Method != http.MethodPut {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		if boardToken != "" {
+			t := r.URL.Query().Get("token")
+			if t == "" {
+				t = r.Header.Get("X-Smartcast-Token")
+			}
+			if t != boardToken {
+				http.Error(w, "token invalid", 403)
+				return
+			}
+		}
+		q := r.URL.Query().Get("quality")
+		if q == "" {
+			var body struct {
+				Quality string `json:"quality"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			q = body.Quality
+		}
+		q = setBoardQuality(q)
+		notifyPadQuality(boardRoom, q)
+		logf("画质已切换为 %s (由教师端设置)", q)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":      true,
+			"quality": q,
 		})
 	})
 	// 教师端/调试: POST /api/stop 断开当前 pad
@@ -212,6 +294,7 @@ func main() {
 	logf("✅ 智慧投屏(黑板端)已启动")
 	logf("   名称: %s", boardName)
 	logf("   端口: %d  房间: %s", boardPort, boardRoom)
+	logf("   画质: %s (教师在界面切换;学生不可改)", getBoardQuality())
 	if boardToken != "" {
 		logf("   Token: 已启用(发现广播自动携带,pad 一键仍可用)")
 	} else {
@@ -317,6 +400,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		"peerOnline": peerAlive,
 		"boardName":  boardName,
 		"tokenOn":    boardToken != "",
+		"quality":    getBoardQuality(),
 	})
 
 	if peerAlive {
@@ -360,6 +444,23 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					"type":    "teacher-stop-ok",
 					"message": "当前无 pad 在投屏",
 				})
+			}
+			continue
+		}
+		// 教师设置画质
+		if role == "browser" && strings.Contains(text, `"type":"set-quality"`) {
+			var msg struct {
+				Type    string `json:"type"`
+				Quality string `json:"quality"`
+			}
+			if json.Unmarshal(data, &msg) == nil {
+				q := setBoardQuality(msg.Quality)
+				notifyPadQuality(roomName, q)
+				_ = client.writeJSON(map[string]interface{}{
+					"type":    "quality-ok",
+					"quality": q,
+				})
+				logf("[%s] 教师设置画质 → %s", roomName, q)
 			}
 			continue
 		}
@@ -481,10 +582,11 @@ func startDiscoveryService(port int) {
 
 func makeAnnounce(port int) discoveryMsg {
 	msg := discoveryMsg{
-		Name: boardName,
-		Port: port,
-		Room: boardRoom,
-		Type: "webrtc",
+		Name:    boardName,
+		Port:    port,
+		Room:    boardRoom,
+		Type:    "webrtc",
+		Quality: getBoardQuality(),
 	}
 	// 仅启用 token 时写入,pad 发现后自动带上;不启用则字段省略
 	if boardToken != "" {

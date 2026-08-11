@@ -56,6 +56,15 @@
   <div id="bar">
     <span class="dot wait" id="dot"></span>
     <span id="status">连接中…</span>
+    <label style="display:flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap;">
+      画质
+      <select id="qualitySel" title="仅教师可改,学生 pad 无此选项"
+        style="background:#333;color:#fff;border:1px solid #555;border-radius:4px;padding:4px 6px;">
+        <option value="balanced">均衡(推荐)</option>
+        <option value="clear">清晰</option>
+        <option value="smooth">流畅</option>
+      </select>
+    </label>
     <button id="stopCastBtn" title="断开当前学生/老师投屏">断开投屏</button>
     <button id="fullBtn">全屏</button>
   </div>
@@ -70,24 +79,50 @@
     document.title = "智慧投屏";
 
     const video = document.getElementById("video");
+    // 低延迟:尽快开始播,不堆播放缓冲
+    try { video.playsInline = true; } catch (_) {}
+    try {
+      if ("latencyHint" in video) video.latencyHint = "interactive";
+    } catch (_) {}
     const dot = document.getElementById("dot");
     const statusEl = document.getElementById("status");
     const waiting = document.getElementById("waiting");
     const waitText = document.getElementById("waitText");
     const bar = document.getElementById("bar");
+    const qualitySel = document.getElementById("qualitySel");
+    let currentQuality = "balanced";
 
     function setStatus(text, kind) {
       statusEl.textContent = text;
       dot.className = "dot " + (kind || "");
     }
 
-    // 启动时拉一下黑板名(可选)
+    function qualityLabel(q) {
+      return ({ balanced: "均衡", clear: "清晰", smooth: "流畅" })[q] || q;
+    }
+
+    // 启动时拉黑板名 + 当前画质
     fetch("/api/info").then(r => r.json()).then(info => {
       if (info && info.name) {
         document.title = "智慧投屏 - " + info.name;
         document.getElementById("roomTag").textContent = info.name + " · 等待投屏";
       }
+      if (info && info.quality) {
+        currentQuality = info.quality;
+        qualitySel.value = info.quality;
+      }
     }).catch(() => {});
+
+    // 教师切换画质 → 通知 pad(学生端无此控件)
+    qualitySel.onchange = () => {
+      const q = qualitySel.value;
+      currentQuality = q;
+      send({ type: "set-quality", quality: q });
+      fetch("/api/quality?quality=" + encodeURIComponent(q) +
+        (token ? ("&token=" + encodeURIComponent(token)) : ""), { method: "POST" })
+        .catch(() => {});
+      setStatus("画质切换为" + qualityLabel(q) + "(下一次关键帧后生效)", "wait");
+    };
 
     // WebSocket 连本机信令
     let wsUrl = "ws://" + location.host + "/ws?room=" + encodeURIComponent(room) + "&role=browser";
@@ -115,7 +150,10 @@
 
     function ensurePc() {
       if (pc) return pc;
-      pc = new RTCPeerConnection();
+      // 尽量低延迟:不强制中继
+      pc = new RTCPeerConnection({
+        iceCandidatePoolSize: 0
+      });
       pendingIce = [];
 
       pc.ontrack = (e) => {
@@ -125,6 +163,17 @@
           trackId: e.track?.id,
           readyState: e.track?.readyState
         });
+        // 接收端降低 jitter buffer(支持的浏览器/WebView2)
+        try {
+          const receiver = e.receiver;
+          if (receiver && receiver.playoutDelayHint !== undefined) {
+            receiver.playoutDelayHint = 0;
+          }
+          if (receiver && receiver.jitterBufferTarget !== undefined) {
+            // 毫秒,过小可能更花,教室局域网 50~80 较均衡
+            receiver.jitterBufferTarget = 60;
+          }
+        } catch (_) {}
         // 优先用 stream;没有 stream 就用 track 自建(兼容 a=msid:- xxx)
         if (e.streams && e.streams[0]) {
           video.srcObject = e.streams[0];
@@ -134,7 +183,7 @@
         // 显式 play,部分浏览器 autoplay 即使 muted 也不自动播
         video.play().catch((err) => console.warn("[webrtc] play failed", err));
         waiting.classList.add("hide");
-        setStatus("投屏中", "ok");
+        setStatus("投屏中 · " + qualityLabel(currentQuality), "ok");
 
         // 诊断:几秒后看有没有真正出帧 + 简单码率/帧率
         setTimeout(async () => {
@@ -211,7 +260,8 @@
               const lost = inbound.packetsLost != null ? inbound.packetsLost : 0;
               setStatus(
                 "投屏中 " + video.videoWidth + "x" + video.videoHeight +
-                " · " + codec + " · " + fps + "fps · " + kbps + "kbps",
+                " · " + codec + " · " + fps + "fps · " + kbps + "kbps" +
+                " · " + qualityLabel(currentQuality),
                 "ok"
               );
 
@@ -329,6 +379,10 @@
             document.title = "智慧投屏 - " + msg.boardName;
             document.getElementById("roomTag").textContent = msg.boardName + " · 等待投屏";
           }
+          if (msg.quality) {
+            currentQuality = msg.quality;
+            qualitySel.value = msg.quality;
+          }
           if (msg.peerOnline) {
             setStatus("pad 在线,等待画面…", "wait");
             waitText.textContent = "pad 在线,正在建立画面…";
@@ -349,6 +403,12 @@
           setStatus(msg.message || "已处理断开", "wait");
           waiting.classList.remove("hide");
           waitText.textContent = msg.message || "等待 pad 投屏…";
+        } else if (msg.type === "quality-ok") {
+          if (msg.quality) {
+            currentQuality = msg.quality;
+            qualitySel.value = msg.quality;
+            setStatus("画质已设为" + qualityLabel(msg.quality), "ok");
+          }
         }
       } catch (err) {
         console.error("[webrtc] 协商出错", err);

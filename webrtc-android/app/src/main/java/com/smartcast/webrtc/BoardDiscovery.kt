@@ -33,6 +33,8 @@ class BoardDiscovery(private val context: Context) {
         val room: String,
         /** 发现广播里的 token;空=黑板未启用 token,不影响连接 */
         val token: String,
+        /** 黑板控制的画质:balanced|clear|smooth */
+        val quality: String,
         val lastSeen: Long
     )
 
@@ -114,22 +116,27 @@ class BoardDiscovery(private val context: Context) {
             val port = json.optInt("port", 8080)
             val room = json.optString("room", "default").ifEmpty { "default" }
             val token = json.optString("token", "")
+            val quality = json.optString("quality", "balanced").ifEmpty { "balanced" }
             val host = json.optString("ip").ifEmpty { fromIp }
 
             synchronized(lock) {
                 val now = System.currentTimeMillis()
-                val board = Board(name, host, port, room, token, now)
+                val board = Board(name, host, port, room, token, quality, now)
                 val existing = foundBoards[name]
                 if (existing != null) {
                     val mySame = sameSegment(host)
                     val exSame = sameSegment(existing.host)
                     when {
                         mySame && exSame -> foundBoards[name] = existing.copy(
-                            lastSeen = now, token = token.ifEmpty { existing.token }
+                            lastSeen = now,
+                            token = token.ifEmpty { existing.token },
+                            quality = quality.ifEmpty { existing.quality }
                         )
                         mySame && !exSame -> foundBoards[name] = board
                         !mySame && exSame -> foundBoards[name] = existing.copy(
-                            lastSeen = now, token = token.ifEmpty { existing.token }
+                            lastSeen = now,
+                            token = token.ifEmpty { existing.token },
+                            quality = quality.ifEmpty { existing.quality }
                         )
                         else -> foundBoards[name] = board
                     }
@@ -137,7 +144,7 @@ class BoardDiscovery(private val context: Context) {
                     foundBoards[name] = board
                 }
             }
-            Log.i(TAG, "发现黑板: $name → $host:$port room=$room token=${token.isNotEmpty()}")
+            Log.i(TAG, "发现黑板: $name → $host:$port room=$room quality=$quality token=${token.isNotEmpty()}")
             notifyFound()
         } catch (_: Exception) {
             Log.w(TAG, "解析广播包失败: $text")

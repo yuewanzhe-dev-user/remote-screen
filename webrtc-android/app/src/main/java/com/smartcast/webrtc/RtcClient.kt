@@ -48,47 +48,62 @@ class RtcClient(
     /** 可选;空字符串=不带 token(默认,一键连接) */
     private val token: String = "",
     /**
-     * 画质档位:
-     *  "720"  → 上限 1280x720
-     *  "1080" → 上限 1920x1080(默认,更清晰)
-     *  "native" → 尽量原分辨率(可能超硬编能力,风险高)
+     * 画质由黑板控制:
+     *  balanced 均衡(默认) / clear 清晰 / smooth 流畅
+     *  兼容旧值 720/1080
      */
-    private val quality: String = "1080",
+    private var quality: String = "balanced",
     private val onStatus: (String) -> Unit
 ) {
     companion object {
         private const val TAG = "RtcClient"
         private const val STREAM_ID = "smartcast-stream"
         private const val VIDEO_TRACK_ID = "smartcast-video"
-        private const val FPS = 24
         private const val PREFERRED_CODEC = "H264"
         private const val HEARTBEAT_MS = 10_000L
         private const val STATS_MS = 2_000L
-        /** 投屏关键帧间隔:花屏恢复 + 中途接入更快出清画 */
-        private const val KEYFRAME_INTERVAL_MS = 3_000L
+        /** 更勤关键帧:减轻切 app/滑动时的糊一阵 */
+        private const val KEYFRAME_INTERVAL_MS = 2_000L
     }
 
-    // 按画质档位设码率(局域网投屏可适当高)
-    private val minBitrateBps: Int
-    private val maxBitrateBps: Int
-    private val startBitrateBps: Int
-    private val maxCaptureW: Int
-    private val maxCaptureH: Int
+    // 当前档参数(教师可在投屏中切换,主要改码率/帧率;分辨率在下次重投更稳)
+    @Volatile private var minBitrateBps: Int = 900_000
+    @Volatile private var maxBitrateBps: Int = 3_500_000
+    @Volatile private var startBitrateBps: Int = 2_500_000
+    @Volatile private var maxCaptureW: Int = 1600
+    @Volatile private var maxCaptureH: Int = 900
+    @Volatile private var targetFps: Int = 24
 
     init {
-        when (quality.lowercase()) {
-            "720", "720p" -> {
-                maxCaptureW = 1280; maxCaptureH = 720
-                minBitrateBps = 800_000; maxBitrateBps = 3_000_000; startBitrateBps = 2_200_000
+        applyQualityProfile(quality, log = false)
+    }
+
+    private fun applyQualityProfile(q: String, log: Boolean) {
+        quality = when (q.lowercase()) {
+            "clear", "1080", "1080p", "high" -> "clear"
+            "smooth", "720", "720p", "low" -> "smooth"
+            else -> "balanced"
+        }
+        when (quality) {
+            "smooth" -> {
+                // 流畅:720p 偏码率够用、延迟友好
+                maxCaptureW = 1280; maxCaptureH = 720; targetFps = 30
+                minBitrateBps = 700_000; maxBitrateBps = 2_500_000; startBitrateBps = 1_800_000
             }
-            "native", "raw", "full" -> {
-                maxCaptureW = 2560; maxCaptureH = 1600
-                minBitrateBps = 1_200_000; maxBitrateBps = 6_000_000; startBitrateBps = 4_000_000
+            "clear" -> {
+                // 清晰:接近 1080p,码率更高
+                maxCaptureW = 1920; maxCaptureH = 1080; targetFps = 24
+                minBitrateBps = 1_200_000; maxBitrateBps = 4_500_000; startBitrateBps = 3_200_000
             }
-            else -> { // 1080 默认
-                maxCaptureW = 1920; maxCaptureH = 1080
-                minBitrateBps = 1_000_000; maxBitrateBps = 5_000_000; startBitrateBps = 3_500_000
+            else -> {
+                // 均衡:约 900p,清晰与延迟折中(推荐默认)
+                maxCaptureW = 1600; maxCaptureH = 900; targetFps = 24
+                minBitrateBps = 900_000; maxBitrateBps = 3_500_000; startBitrateBps = 2_500_000
             }
+        }
+        if (log) {
+            Log.i(TAG, "画质 → $quality 上限 ${maxCaptureW}x${maxCaptureH} " +
+                "码率 ${startBitrateBps / 1000}~${maxBitrateBps / 1000}kbps @${targetFps}fps")
         }
     }
 
@@ -142,7 +157,7 @@ class RtcClient(
         kicked = false
         currentMaxBitrate = startBitrateBps
         scheduler = Executors.newSingleThreadScheduledExecutor()
-        Log.i(TAG, "画质档位=$quality 上限 ${maxCaptureW}x${maxCaptureH} 码率 ${startBitrateBps / 1000}~${maxBitrateBps / 1000}kbps @${FPS}fps")
+        Log.i(TAG, "画质档位=$quality 上限 ${maxCaptureW}x${maxCaptureH} 码率 ${startBitrateBps / 1000}~${maxBitrateBps / 1000}kbps @${targetFps}fps")
         connectSignaling()
     }
 
@@ -274,9 +289,18 @@ class RtcClient(
             when (json.optString("type")) {
                 "joined" -> {
                     val peerOnline = json.optBoolean("peerOnline")
-                    Log.i(TAG, "已加入房间,浏览器在线:$peerOnline")
+                    val q = json.optString("quality")
+                    if (q.isNotEmpty()) {
+                        applyQualityFromBoard(q)
+                    }
+                    Log.i(TAG, "已加入房间,浏览器在线:$peerOnline quality=$quality")
                     if (peerOnline) createOffer()
                     else updateStatus("已连信令,等待浏览器打开…")
+                }
+                "quality" -> {
+                    // 教师在 exe 上改画质
+                    val q = json.optString("quality")
+                    if (q.isNotEmpty()) applyQualityFromBoard(q)
                 }
                 "peer-online" -> {
                     Log.i(TAG, "浏览器已上线,发起 offer")
@@ -444,7 +468,7 @@ class RtcClient(
         if (ch < 360) { ch = 360; if (ch % 2 != 0) ch -= 1 }
         captureWidth = cw
         captureHeight = ch
-        Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 抓屏 ${cw}x${ch} @${FPS}fps (quality=$quality)")
+        Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 抓屏 ${cw}x${ch} @${targetFps}fps (quality=$quality)")
 
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
         videoSource = factory!!.createVideoSource(true)
@@ -467,7 +491,7 @@ class RtcClient(
         }
 
         videoCapturer!!.initialize(surfaceHelper, context, wrappedObserver)
-        videoCapturer!!.startCapture(cw, ch, FPS)
+        videoCapturer!!.startCapture(cw, ch, targetFps)
 
         videoTrack = factory!!.createVideoTrack(VIDEO_TRACK_ID, videoSource)
         videoTrack!!.setEnabled(true)
@@ -494,7 +518,7 @@ class RtcClient(
                 val enc = params.encodings[0]
                 enc.maxBitrateBps = capped
                 try { enc.minBitrateBps = minBitrateBps } catch (_: Exception) {}
-                try { enc.maxFramerate = FPS } catch (_: Exception) {}
+                try { enc.maxFramerate = targetFps } catch (_: Exception) {}
                 try { enc.scaleResolutionDownBy = 1.0 } catch (_: Exception) {}
             }
             try {
@@ -505,10 +529,35 @@ class RtcClient(
             sender.parameters = params
             currentMaxBitrate = capped
             if (log) {
-                Log.i(TAG, "RtpSender 约束: maxBitrate=${capped / 1000}kbps maxFps=$FPS quality=$quality")
+                Log.i(TAG, "RtpSender 约束: maxBitrate=${capped / 1000}kbps maxFps=$targetFps quality=$quality")
             }
         } catch (e: Exception) {
             Log.w(TAG, "设置 RtpSender 参数失败: ${e.message}")
+        }
+    }
+
+    /** 教师改画质:热更新码率/帧率,并尽快关键帧消糊 */
+    private fun applyQualityFromBoard(q: String) {
+        val old = quality
+        applyQualityProfile(q, log = true)
+        currentMaxBitrate = startBitrateBps
+        executor.execute {
+            try {
+                // 尝试改抓帧率(分辨率中途改不稳定,仅改 fps/码率)
+                try { videoCapturer?.changeCaptureFormat(captureWidth, captureHeight, targetFps) } catch (_: Exception) {}
+                applySenderBitrate(startBitrateBps, log = true)
+                requestKeyframe("quality-change")
+                updateStatus("画质已切换: ${when (quality) {
+                    "clear" -> "清晰"
+                    "smooth" -> "流畅"
+                    else -> "均衡"
+                }}")
+            } catch (e: Exception) {
+                Log.w(TAG, "应用画质失败: ${e.message}")
+            }
+        }
+        if (old != quality) {
+            Log.i(TAG, "黑板画质指令 $old → $quality")
         }
     }
 
