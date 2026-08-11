@@ -336,6 +336,40 @@ func durStr(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+// monitorFFplayStderr 边转发 ffplay 日志到控制台,边监控解码错误。
+// 发现解码错误(concealing/error/missing reference 等),立即请 pad 补关键帧。
+// 借鉴 scrcpy:解码端报错 → 主动要 I 帧,而不是干等下个关键帧(最坏 2 秒花屏)。
+//
+// 节流:最多每 500ms 发一次 reqkey,避免连续错误刷屏。
+func monitorFFplayStderr(r io.Reader, conn net.Conn) {
+	br := bufio.NewReader(r)
+	var lastReqKey time.Time
+	for {
+		line, err := br.ReadString('\n')
+		if len(line) > 0 {
+			// 转发到控制台
+			fmt.Print("[ffplay] " + line)
+			low := strings.ToLower(line)
+			// 这些关键词说明解码出问题:丢包/花屏/参考帧丢失
+			if strings.Contains(low, "error") ||
+				strings.Contains(low, "concealing") ||
+				strings.Contains(low, "missing reference") ||
+				strings.Contains(low, "corrupt") ||
+				strings.Contains(low, "invalid data") {
+				if time.Since(lastReqKey) > 500*time.Millisecond {
+					conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+					conn.Write([]byte(`{"cmd":"reqkey"}` + "\n"))
+					lastReqKey = time.Now()
+					logf("⚡ 检测到解码异常,已请 pad 补关键帧")
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
 func serveClient(conn net.Conn) {
 	addr := conn.RemoteAddr().String()
 
@@ -427,7 +461,13 @@ func serveClient(conn net.Conn) {
 		"-top", "0",
 	)
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// 捕获 stderr:既要在控制台显示,又要监控解码错误(发现错误就请 pad 补关键帧)
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		cmd.Stderr = os.Stderr
+	} else {
+		go monitorFFplayStderr(stderrPipe, conn)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
