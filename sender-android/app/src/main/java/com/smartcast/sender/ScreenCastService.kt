@@ -113,7 +113,14 @@ class ScreenCastService : Service() {
 
         startForeground()
         if (data != null) {
-            startCasting(resultCode, data)
+            try {
+                startCasting(resultCode, data)
+            } catch (e: Exception) {
+                // 兜底:任何初始化异常都只提示,绝不让服务崩溃导致 app 闪退
+                Log.e(TAG, "投屏启动失败: ${e.message}", e)
+                updateStatus("启动失败:${e.message}")
+                stopSelf()
+            }
         }
         return START_NOT_STICKY
     }
@@ -168,43 +175,96 @@ class ScreenCastService : Service() {
         Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 编码 ${w}x${h},目标 $targetHost:$targetPort")
 
         // 配置 H.264 编码器(低延迟:关 B 帧 + 低延迟模式,减少解码端排队延迟)
-        val format = MediaFormat.createVideoFormat("video/avc", w, h).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, INIT_BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
-            setInteger(MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0) // 关 B 帧,画面按序输出,延迟更低
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            }
+        // 注意:个别国产 ROM 编码器不支持扩展参数,configure 会抛
+        // IllegalArgumentException 导致闪退(有实测案例),这里做多级配置回退,
+        // 保证任何 pad 都能出画面;即使全部失败也只提示、不再崩溃。
+        try {
+            encoder = createEncoder(w, h)
+            if (encoder == null) throw IllegalStateException("没有可用的 H.264 编码器")
+            val inputSurface = encoder!!.createInputSurface()
+
+            // MediaProjection 把屏幕画面投到编码器的 inputSurface(用缩放后的分辨率)
+            virtualDisplay = projection!!.createVirtualDisplay(
+                "smartcast", w, h, metrics.densityDpi,
+                0, inputSurface, null, null
+            )
+
+            // 编码器只 start 一次,独立于网络连接。
+            // 这样网络重连时不会重复 start(否则会报错或丢帧),
+            // 也不会因为重连失败导致编码器永远没启动(0 帧问题)。
+            encoder!!.start()
+        } catch (e: Exception) {
+            Log.e(TAG, "编码初始化失败: ${e.message}", e)
+            updateStatus("初始化失败,请重试")
+            // 清理已分配的资源,避免泄漏
+            try { virtualDisplay?.release() } catch (_: Exception) {}
+            try { encoder?.release() } catch (_: Exception) {}
+            try { projection?.stop() } catch (_: Exception) {}
+            try { wakeLock?.release() } catch (_: Exception) {}
+            virtualDisplay = null
+            encoder = null
+            return
         }
-
-        encoder = MediaCodec.createEncoderByType("video/avc").apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        }
-        val inputSurface = encoder!!.createInputSurface()
-
-        // MediaProjection 把屏幕画面投到编码器的 inputSurface(用缩放后的分辨率)
-        virtualDisplay = projection!!.createVirtualDisplay(
-            "smartcast", w, h, metrics.densityDpi,
-            0, inputSurface, null, null
-        )
-
-        // 编码器只 start 一次,独立于网络连接。
-        // 这样网络重连时不会重复 start(否则会报错或丢帧),
-        // 也不会因为重连失败导致编码器永远没启动(0 帧问题)。
-        encoder!!.start()
 
         running = true
         updateStatus("正在连接 $targetHost…")
         streamThread = thread(name = "smartcast-stream") {
             streamLoopWithReconnect()
         }
+    }
+
+    /**
+     * 创建 H.264 编码器,带多级配置回退。
+     * 优先用低延迟配置(关 B 帧 + 低延迟模式);部分国产 ROM 的编码器
+     * 不支持这些参数,configure 会抛 IllegalArgumentException,逐级回退:
+     *   增强配置(VBR + 关B帧 + 低延迟) → 基础配置(VBR) → 最简配置(默认CBR)
+     * 保证任何 pad 都能出画面,只是部分设备延迟略高。
+     */
+    private fun createEncoder(w: Int, h: Int): MediaCodec? {
+        val configs = listOf(enhancedFormat(w, h), basicFormat(w, h), minimalFormat(w, h))
+        for (format in configs) {
+            try {
+                val codec = MediaCodec.createEncoderByType("video/avc") ?: continue
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                Log.i(TAG, "编码器配置成功: ${format.keySet()}")
+                return codec
+            } catch (e: Exception) {
+                Log.w(TAG, "编码器配置失败,尝试下一档配置: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    /** 增强配置:VBR + 关 B 帧 + 低延迟模式(延迟最低,但部分编码器不支持) */
+    private fun enhancedFormat(w: Int, h: Int) = MediaFormat.createVideoFormat("video/avc", w, h).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        setInteger(MediaFormat.KEY_BIT_RATE, INIT_BITRATE)
+        setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0) // 关 B 帧,画面按序输出,延迟更低
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
+    }
+
+    /** 基础配置:VBR,不带扩展参数(兼容大多数设备) */
+    private fun basicFormat(w: Int, h: Int) = MediaFormat.createVideoFormat("video/avc", w, h).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        setInteger(MediaFormat.KEY_BIT_RATE, INIT_BITRATE)
+        setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+        setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+    }
+
+    /** 最简配置:不带扩展参数、默认 CBR(兜底,兼容性最好) */
+    private fun minimalFormat(w: Int, h: Int) = MediaFormat.createVideoFormat("video/avc", w, h).apply {
+        setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        setInteger(MediaFormat.KEY_BIT_RATE, INIT_BITRATE)
+        setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
     }
 
     /**
