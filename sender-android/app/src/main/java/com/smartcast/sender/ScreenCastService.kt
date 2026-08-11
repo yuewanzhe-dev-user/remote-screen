@@ -88,6 +88,8 @@ class ScreenCastService : Service() {
     private var socket: Socket? = null
     private var streamThread: Thread? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    // WiFi 锁:防止 pad 屏幕熄灭后 WiFi 进入低功耗/省电模式导致 socket 周期性断开
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
     @Volatile private var running = false
     @Volatile private var connected = false
 
@@ -152,8 +154,18 @@ class ScreenCastService : Service() {
 
     private fun startCasting(resultCode: Int, data: Intent) {
         // 息屏保活:课堂常见"学生投完把 pad 一放",屏幕熄灭后投屏仍要继续
+        // WakeLock 保 CPU 不睡,WiFi Lock 保网卡不进省电模式(两者缺一不可)
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "smartcast:cast").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        // WiFi 锁:HIGH_PERF 模式禁用 WiFi 省电,防止熄屏后 socket 周期性被掐断
+        val wifi = getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+        wifiLock = wifi.createWifiLock(
+            android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "smartcast:cast"
+        ).apply {
             setReferenceCounted(false)
             acquire()
         }
@@ -296,6 +308,7 @@ class ScreenCastService : Service() {
                 updateStatus("连接中…")
                 socket = Socket()
                 socket!!.keepAlive = true
+                socket!!.tcpNoDelay = true // 禁用 Nagle,减少小包延迟
                 socket!!.soTimeout = CONTROL_READ_TIMEOUT_MS // 控制消息读超时(兼作失联检测)
                 socket!!.connect(java.net.InetSocketAddress(targetHost, targetPort), 3000)
                 out = socket!!.getOutputStream()
@@ -535,6 +548,7 @@ class ScreenCastService : Service() {
         try { projection?.stop() } catch (_: Exception) {}
         socket?.close()
         try { wakeLock?.release() } catch (_: Exception) {}
+        try { wifiLock?.release() } catch (_: Exception) {}
         updateStatus("已停止")
         super.onDestroy()
     }
