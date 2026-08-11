@@ -405,8 +405,9 @@ class ScreenCastService : Service() {
     private fun setEncoderBitrate(bps: Int) {
         if (bps == currentBitrate) return
         try {
+            // PARAMETER_KEY_BITRATE 常量在某些 SDK 版本非公开,直接用其字符串值 "video-bitrate"
             val params = android.os.Bundle()
-            params.putInt(MediaCodec.PARAMETER_KEY_BITRATE, bps)
+            params.putInt("video-bitrate", bps)
             encoder?.setParameters(params)
             currentBitrate = bps
             Log.i(TAG, "自适应码率:${bps / 1000} kbps")
@@ -420,8 +421,9 @@ class ScreenCastService : Service() {
     private fun requestKeyFrame() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             try {
+                // PARAMETER_KEY_REQUEST_SYNC_FRAME 常量在某些 SDK 版本非公开,直接用其字符串值 "request-sync-frame"
                 val params = android.os.Bundle()
-                params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                params.putInt("request-sync-frame", 0)
                 encoder?.setParameters(params)
                 Log.i(TAG, "已请求关键帧")
             } catch (e: Exception) {
