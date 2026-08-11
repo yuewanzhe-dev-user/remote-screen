@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <!-- 访问 WiFi 信息(拿多播锁需要) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- 息屏保活:pad 屏幕熄灭时投屏继续 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14 (targetSdk 34) 起,投屏类型前台服务必须声明此权限,否则启动崩溃 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
