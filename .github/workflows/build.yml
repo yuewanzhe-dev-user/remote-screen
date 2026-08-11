@@ -195,10 +195,14 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: 整理依赖
+      # go-webview2 无正式 tag:使用 go.mod 中的伪版本 + 已提交 go.sum
+      # 不在 CI 里 go get 假 tag,避免 unknown revision
+      - name: 下载依赖
         if: steps.exists.outputs.has == 'true'
         working-directory: signaling-go
-        run: go mod tidy
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: go mod download
 
       # go-webview2 为纯 Go + Win32,交叉编译 CGO_ENABLED=0 即可
       - name: 交叉编译为 Windows EXE (内嵌 HTML + WebView2)
@@ -208,6 +212,7 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: 0
+          GOPROXY: https://proxy.golang.org,direct
         run: go build -ldflags="-s -w" -o 智慧投屏-黑板.exe .
 
       - name: 上传 EXE
