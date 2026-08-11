@@ -38,6 +38,8 @@ class MainActivity : AppCompatActivity() {
     private var discovery: BoardDiscovery? = null
     private var lastBoardNames: List<String>? = null
     private var latestBoards: List<BoardDiscovery.Board> = emptyList()
+    private var discoveryStartedAt = 0L
+    private val isolationHintRunnable = Runnable { showIsolationHintIfNeeded() }
 
     // 即将投屏的目标(发现点选 或 手输)
     private var pendingServer: String = ""
@@ -104,6 +106,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun startBoardDiscovery() {
         tvBoardsHint.text = "正在搜索本教室黑板…"
+        discoveryStartedAt = System.currentTimeMillis()
+        mainHandler.removeCallbacks(isolationHintRunnable)
+        // 8 秒仍无黑板 → 明确提示客户端隔离/同 WiFi
+        mainHandler.postDelayed(isolationHintRunnable, 8_000)
+        // 20 秒再强调一次
+        mainHandler.postDelayed(isolationHintRunnable, 20_000)
+
         discovery = BoardDiscovery(this)
         discovery?.startDiscovery { boards ->
             mainHandler.post {
@@ -111,9 +120,16 @@ class MainActivity : AppCompatActivity() {
                 val names = boards.map { "${it.name}  (${it.host}:${it.port})" }
                 if (names == lastBoardNames) return@post
                 lastBoardNames = names
-                tvBoardsHint.text = when {
-                    boards.isEmpty() -> "未发现黑板,可展开下方「高级设置」手输"
-                    else -> "发现 ${boards.size} 块黑板,点击即可投屏:"
+                if (boards.isNotEmpty()) {
+                    mainHandler.removeCallbacks(isolationHintRunnable)
+                    tvBoardsHint.text = "发现 ${boards.size} 块黑板,点击即可投屏:"
+                } else {
+                    val waited = System.currentTimeMillis() - discoveryStartedAt
+                    tvBoardsHint.text = if (waited >= 8_000) {
+                        isolationHintText()
+                    } else {
+                        "正在搜索本教室黑板…"
+                    }
                 }
                 lvBoards.adapter = ArrayAdapter(
                     this@MainActivity,
@@ -133,6 +149,22 @@ class MainActivity : AppCompatActivity() {
                     captureLauncher.launch(projectionManager.createScreenCaptureIntent())
                 }
             }
+        }
+    }
+
+    private fun isolationHintText(): String {
+        return "未发现黑板。请确认：\n" +
+            "1) pad 与黑板连同一教室 WiFi\n" +
+            "2) 黑板上「智慧投屏」exe 已运行\n" +
+            "3) 若仍搜不到,多为 WiFi「客户端隔离」,请网管关闭或展开下方高级设置手输 IP"
+    }
+
+    private fun showIsolationHintIfNeeded() {
+        if (latestBoards.isNotEmpty()) return
+        tvBoardsHint.text = isolationHintText()
+        // 同时把状态栏也提示一下
+        if (!btnStop.isEnabled) {
+            tvStatus.text = "状态:未发现黑板,检查同网/客户端隔离"
         }
     }
 
@@ -181,6 +213,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(isolationHintRunnable)
         discovery?.stopDiscovery()
         super.onDestroy()
     }

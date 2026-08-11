@@ -164,8 +164,11 @@
           } catch (_) {}
         }, 2500);
 
-        // 持续刷新分辨率到状态栏(每 5 秒)
+        // 持续刷新分辨率/码率/codec;丢包或解码停滞时请求关键帧(PLI)
         if (window.__statsTimer) clearInterval(window.__statsTimer);
+        window.__lastBytes = null;
+        window.__lastFramesDecoded = null;
+        window.__lastPliAt = 0;
         window.__statsTimer = setInterval(async () => {
           if (!pc || pc.iceConnectionState === "closed") {
             clearInterval(window.__statsTimer);
@@ -175,7 +178,9 @@
             const stats = await pc.getStats();
             let inbound = null;
             stats.forEach((r) => {
-              if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
+              if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
+                inbound = r;
+              }
             });
             if (inbound && video.videoWidth) {
               const fps = inbound.framesPerSecond != null
@@ -185,11 +190,39 @@
                 ? Math.round((inbound.bytesReceived - window.__lastBytes) * 8 / 5 / 1000)
                 : "-";
               window.__lastBytes = inbound.bytesReceived;
+              const codec = (inbound.mimeType || "").replace("video/", "") || "?";
+              const lost = inbound.packetsLost != null ? inbound.packetsLost : 0;
               setStatus(
                 "投屏中 " + video.videoWidth + "x" + video.videoHeight +
-                " · " + fps + "fps · " + kbps + "kbps",
+                " · " + codec + " · " + fps + "fps · " + kbps + "kbps",
                 "ok"
               );
+
+              // 解码停滞或明显丢包 → 请求关键帧(PLI)
+              const decoded = inbound.framesDecoded || 0;
+              const stalled = window.__lastFramesDecoded != null &&
+                decoded === window.__lastFramesDecoded && video.videoWidth > 0;
+              window.__lastFramesDecoded = decoded;
+              const now = Date.now();
+              if ((stalled || lost > (window.__lastLost || 0) + 20) &&
+                  now - window.__lastPliAt > 2000) {
+                window.__lastPliAt = now;
+                try {
+                  const receivers = pc.getReceivers ? pc.getReceivers() : [];
+                  receivers.forEach((r) => {
+                    if (r.track && r.track.kind === "video") {
+                      // 部分浏览器支持
+                      if (typeof r.requestKeyFrame === "function") {
+                        r.requestKeyFrame();
+                        console.log("[webrtc] requestKeyFrame (PLI)");
+                      }
+                    }
+                  });
+                } catch (e) {
+                  console.warn("[webrtc] PLI failed", e);
+                }
+              }
+              window.__lastLost = lost;
             }
           } catch (_) {}
         }, 5000);
@@ -253,8 +286,11 @@
           console.log("[webrtc] answer sent, codecs:",
             (answer.sdp || "").match(/a=rtpmap:\d+ \w+/g));
         } else if (msg.type === "ice") {
+          // 过滤空 candidate / 异常字段
+          if (!msg.data || (!msg.data.candidate && msg.data.candidate !== "")) {
+            return;
+          }
           if (!pc || !pc.remoteDescription) {
-            // offer 还没到,先缓存
             pendingIce.push(msg.data);
           } else {
             await pc.addIceCandidate(msg.data).catch(() => {});
@@ -264,6 +300,13 @@
           waiting.classList.remove("hide");
           waitText.textContent = "pad 已断开,等待重新投屏…";
           resetPc();
+        } else if (msg.type === "session-reset") {
+          // 新 pad 顶替:立刻丢掉旧 PC/旧码流,避免两个 pad 画面串扰
+          console.log("[webrtc] session-reset", msg.reason || "");
+          resetPc();
+          waiting.classList.remove("hide");
+          waitText.textContent = "切换投屏设备中…";
+          setStatus("切换投屏设备中…", "wait");
         } else if (msg.type === "joined") {
           if (msg.boardName) {
             document.title = "智慧投屏 - " + msg.boardName;
@@ -277,6 +320,12 @@
             waitText.textContent = "等待 pad 投屏…";
           }
         } else if (msg.type === "peer-online") {
+          // 新 pad 上线时也清一次,防止仍挂着上一路流
+          if (pc) {
+            console.log("[webrtc] peer-online → reset old pc");
+            resetPc();
+          }
+          waiting.classList.remove("hide");
           setStatus("pad 已连接,等待画面…", "wait");
           waitText.textContent = "pad 已连接,正在建立画面…";
         }

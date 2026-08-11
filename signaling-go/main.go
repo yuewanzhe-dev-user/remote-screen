@@ -231,15 +231,18 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	room := getRoom(roomName)
 
 	// 登记 + 顶替
+	replacedPad := false
 	if role == "pad" {
 		room.padMu.Lock()
 		old := room.pad
 		room.pad = client
 		room.padMu.Unlock()
 		if old != nil {
-			// 新 pad 顶替旧 pad
+			// 先通知旧 pad 被顶,稍等再关,尽量让 kicked 发出去
 			_ = old.writeJSON(map[string]string{"type": "kicked"})
+			time.Sleep(120 * time.Millisecond)
 			old.close()
+			replacedPad = true
 			logf("[%s] 新 pad 顶替旧连接", roomName)
 		}
 	} else {
@@ -273,13 +276,29 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 新 pad 顶替后,立刻让浏览器丢掉旧画面,避免 A/B 媒体串扰
+	if replacedPad {
+		if br := peerClient(room, "browser"); br != nil {
+			_ = br.writeJSON(map[string]string{"type": "session-reset", "reason": "pad-replaced"})
+			_ = br.writeJSON(map[string]string{"type": "peer-online"})
+		}
+	}
+
 	logf("[%s] %s 加入%s", roomName, role, map[bool]string{true: "(对方在线)", false: "(等待对方)"}[peerAlive])
 
-	// 读消息并转发给对端
+	// 读消息并转发给对端;忽略应用层 ping
 	for {
 		_, data, err := raw.ReadMessage()
 		if err != nil {
 			break
+		}
+		// ping 不转发
+		if strings.Contains(string(data), `"type":"ping"`) {
+			_ = client.writeJSON(map[string]string{"type": "pong"})
+			continue
+		}
+		if strings.Contains(string(data), `"type":"pong"`) {
+			continue
 		}
 		peer := peerClient(room, peerRole)
 		if peer != nil {
