@@ -14,22 +14,38 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 
 /**
  * 投屏前台服务:MediaProjection 抓屏 → MediaCodec 编 H.264 → TCP 推流到黑板。
  *
- * Step2 增强:
+ * 协议 v2(与黑板端 main.go 对齐,需两端同时更新):
+ *   pad → 黑板:一行 JSON 身份 {"v":1,"name":"设备型号"} → 8 字节分辨率头 → H.264 裸流
+ *   黑板 → pad:行分隔 JSON 控制消息:
+ *     {"cmd":"hb"}      心跳(每 5 秒),pad 据此检测黑板端失联
+ *     {"cmd":"kicked"}  被其他 pad 顶替,停止投屏、不再重连
+ *     {"cmd":"stop"}    黑板端结束投屏(老师关掉画面),停止投屏
+ *
+ * 增强:
  *   - 分辨率自适应:屏幕超过 1080p 时降到 1080p(16:9 等比缩放,带宽延迟友好)
  *   - 首帧快速出画面:连接后立即发送一个关键帧(I帧),避免开场黑屏/花屏
- *   - 断线自动重连:网络抖动断了不用学生手动重点,后台重连
+ *   - 断线自动重连(被顶替/黑板端停止除外),网络抖动学生无感
+ *   - 自适应码率:按实际吞吐在 1.5M~4M 之间调整,弱 WiFi 下平滑降画质而不是卡死
+ *   - 低延迟编码:关 B 帧(API 26+)、低延迟模式(API 30+),减少解码端延迟
+ *   - 息屏保活:持有 PARTIAL_WAKE_LOCK,pad 屏幕熄灭时投屏不中断
  */
 class ScreenCastService : Service() {
 
@@ -54,9 +70,16 @@ class ScreenCastService : Service() {
         // 目标编码分辨率上限:1080p。高于此分辨率的屏幕等比缩小。
         private const val MAX_WIDTH = 1920
         private const val MAX_HEIGHT = 1080
+        // 码率自适应范围(1.5M~4M,初始 4M)
+        private const val INIT_BITRATE = 4_000_000
+        private const val MIN_BITRATE = 1_500_000
+        private const val MAX_BITRATE = 4_000_000
         // 重连参数
         private const val RECONNECT_DELAY_MS = 2000L
         private const val MAX_RECONNECT = 5
+        // 控制消息读超时:黑板端心跳 5 秒一条,连续 HEARTBEAT_MISS_LIMIT 次超时视为黑板失联
+        private const val CONTROL_READ_TIMEOUT_MS = 5000
+        private const val HEARTBEAT_MISS_LIMIT = 4
     }
 
     private var projection: MediaProjection? = null
@@ -64,12 +87,21 @@ class ScreenCastService : Service() {
     private var virtualDisplay: android.hardware.display.VirtualDisplay? = null
     private var socket: Socket? = null
     private var streamThread: Thread? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var running = false
     @Volatile private var connected = false
+
+    // 黑板端明确告知的停止原因:这两种情况都不重连
+    @Volatile private var serverKicked = false
+    @Volatile private var serverStopped = false
 
     // 当前编码分辨率(等比缩放后的)
     private var encodeWidth = 0
     private var encodeHeight = 0
+
+    // 自适应码率:当前码率 + 累计已写字节数(由码率监控线程每 2 秒采样)
+    @Volatile private var currentBitrate = INIT_BITRATE
+    private val writtenBytes = AtomicLong(0)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -112,6 +144,13 @@ class ScreenCastService : Service() {
     }
 
     private fun startCasting(resultCode: Int, data: Intent) {
+        // 息屏保活:课堂常见"学生投完把 pad 一放",屏幕熄灭后投屏仍要继续
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "smartcast:cast").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+
         val projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = projectionManager.getMediaProjection(resultCode, data)
@@ -124,17 +163,25 @@ class ScreenCastService : Service() {
         val (w, h) = scaleDown(metrics.widthPixels, metrics.heightPixels)
         encodeWidth = w
         encodeHeight = h
+        currentBitrate = INIT_BITRATE
+        writtenBytes.set(0)
         Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 编码 ${w}x${h},目标 $targetHost:$targetPort")
 
-        // 配置 H.264 编码器
+        // 配置 H.264 编码器(低延迟:关 B 帧 + 低延迟模式,减少解码端排队延迟)
         val format = MediaFormat.createVideoFormat("video/avc", w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
+            setInteger(MediaFormat.KEY_BIT_RATE, INIT_BITRATE)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0) // 关 B 帧,画面按序输出,延迟更低
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
         }
 
         encoder = MediaCodec.createEncoderByType("video/avc").apply {
@@ -165,28 +212,38 @@ class ScreenCastService : Service() {
      * 网络断开后,自动重建 socket 重推,最多重试 MAX_RECONNECT 次。
      * 抓屏/编码不停,只重连传输通道,体验上学生无感。
      *
-     * 注意:如果连接成功后很快(3秒内)就断了,多半是被另一个 pad 顶掉,
-     * 这种情况不重连(否则会和另一个 pad 互相顶替,死循环)。
+     * 两种情况不重连:
+     *   - 黑板端发来 {"cmd":"kicked"}(被其他 pad 顶替)
+     *   - 黑板端发来 {"cmd":"stop"}(黑板端结束投屏)
+     * 兜底:连接后 3 秒内断开,多半是被顶替(兼容没有 kicked 消息的老黑板)。
      */
     private fun streamLoopWithReconnect() {
         var retryCount = 0
-        while (running) {
+        startRateMonitor()
+        while (running && !serverKicked && !serverStopped) {
             var out: OutputStream? = null
             val connectTime = System.currentTimeMillis()
             try {
                 updateStatus("连接中…")
                 socket = Socket()
-                socket!!.soTimeout = 5000
+                socket!!.keepAlive = true
+                socket!!.soTimeout = CONTROL_READ_TIMEOUT_MS // 控制消息读超时(兼作失联检测)
                 socket!!.connect(java.net.InetSocketAddress(targetHost, targetPort), 3000)
                 out = socket!!.getOutputStream()
                 connected = true
                 retryCount = 0
                 updateStatus("已连接,投屏中")
 
-                // 先发分辨率头
+                // 协议 v2:先发身份握手(一行 JSON,黑板端据此显示设备名),再发分辨率头
+                val identity = """{"v":1,"name":"${jsonEscape(Build.MODEL)}"}"""
+                out.write(identity.toByteArray())
+                out.write('\n'.code)
                 val header = ByteBuffer.allocate(8).putInt(encodeWidth).putInt(encodeHeight).array()
                 out.write(header)
                 out.flush()
+
+                // 黑板端控制消息监听(kicked/stop/心跳),同时负责检测黑板端失联
+                startControlReader()
 
                 // 编码器已在 startCasting() 中启动,这里不重复 start
                 val codec = encoder!!
@@ -207,6 +264,7 @@ class ScreenCastService : Service() {
                             buf.position(bufferInfo.offset)
                             buf.get(data, 0, bufferInfo.size)
                             out.write(data, 0, bufferInfo.size)
+                            writtenBytes.addAndGet(bufferInfo.size.toLong())
                             codec.releaseOutputBuffer(outIndex, false)
                         }
                         outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -217,9 +275,9 @@ class ScreenCastService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "推流异常: ${e.message}")
                 connected = false
-                if (running) {
+                if (running && !serverKicked && !serverStopped) {
                     // 连接后 3 秒内断开,基本是被另一个 pad 顶掉了(网络抖动不会这么快)。
-                    // 这种情况不重连,避免两个 pad 互相顶替形成死循环。
+                    // 兜底保护:老版本黑板没有 kicked 消息,靠这个避免两个 pad 互相顶替。
                     val aliveMs = System.currentTimeMillis() - connectTime
                     if (aliveMs < 3000) {
                         updateStatus("已被其他投屏替换")
@@ -242,6 +300,119 @@ class ScreenCastService : Service() {
             }
         }
         stopSelf()
+    }
+
+    /**
+     * 监听黑板端控制消息(行分隔 JSON):
+     *   {"cmd":"hb"}      心跳,说明黑板端还活着(平时只有这种消息)
+     *   {"cmd":"kicked"}  被其他 pad 顶替 → 停止投屏,不重连
+     *   {"cmd":"stop"}    黑板端结束投屏 → 停止投屏,不重连
+     *
+     * 黑板端平时每 5 秒发一条心跳;若连续 HEARTBEAT_MISS_LIMIT 次
+     * 超时没收到任何消息,判定黑板端失联(断电/断网),主动断开触发重连。
+     * 收到 EOF(黑板端关闭连接)也立即断开触发重连。
+     */
+    private fun startControlReader() {
+        val s = socket ?: return
+        thread(name = "smartcast-control") {
+            var missCount = 0
+            try {
+                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                while (running) {
+                    var timedOut = false
+                    val line: String? = try {
+                        reader.readLine()
+                    } catch (_: SocketTimeoutException) {
+                        timedOut = true
+                        null // 超时:可能只是心跳间隔,继续等
+                    } catch (_: Exception) {
+                        break // socket 已关闭,属正常
+                    }
+                    if (line == null) {
+                        if (s.isClosed || !running) break
+                        if (timedOut) {
+                            missCount++
+                            if (missCount >= HEARTBEAT_MISS_LIMIT) {
+                                Log.w(TAG, "黑板端 ${missCount * CONTROL_READ_TIMEOUT_MS / 1000} 秒无响应,判定失联")
+                                updateStatus("黑板端失联,正在重连…")
+                                try { s.close() } catch (_: Exception) {}
+                                break
+                            }
+                        } else {
+                            // EOF:黑板端关闭连接,立即断开触发重连
+                            try { s.close() } catch (_: Exception) {}
+                            break
+                        }
+                        continue
+                    }
+                    missCount = 0
+                    if (line.isEmpty()) continue
+                    try {
+                        when (JSONObject(line).optString("cmd")) {
+                            "kicked" -> {
+                                serverKicked = true
+                                updateStatus("已被其他投屏替换")
+                                try { s.close() } catch (_: Exception) {}
+                                break
+                            }
+                            "stop" -> {
+                                serverStopped = true
+                                updateStatus("黑板端已结束投屏")
+                                try { s.close() } catch (_: Exception) {}
+                                break
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "控制消息解析失败: $line")
+                    }
+                }
+            } catch (e: Exception) {
+                // socket 被其他线程关闭等场景,属正常
+            }
+        }
+    }
+
+    /**
+     * 自适应码率:每 2 秒按实际写吞吐调整编码码率。
+     *   - 吞吐 < 当前码率 70% 且码率高于下限 → 降为 80%
+     *   - 吞吐 > 当前码率 95% 且码率低于上限 → 升为 125%
+     * 弱 WiFi 下画质平滑下降而不是卡顿/断流;网络恢复后自动升回。
+     */
+    private fun startRateMonitor() {
+        thread(name = "smartcast-rate") {
+            var lastBytes = writtenBytes.get()
+            var lastTime = System.currentTimeMillis()
+            while (running) {
+                try { Thread.sleep(2000) } catch (_: Exception) { break }
+                val now = System.currentTimeMillis()
+                val bytes = writtenBytes.get()
+                val elapsedSec = (now - lastTime) / 1000.0
+                val rateBps = if (elapsedSec > 0) ((bytes - lastBytes) * 8 / elapsedSec).toLong() else 0L
+                lastBytes = bytes
+                lastTime = now
+                val cur = currentBitrate
+                when {
+                    rateBps > 0 && rateBps < (cur * 0.7).toLong() && cur > MIN_BITRATE ->
+                        setEncoderBitrate(maxOf(MIN_BITRATE, (cur * 0.8).toInt()))
+                    rateBps > (cur * 0.95).toLong() && cur < MAX_BITRATE ->
+                        setEncoderBitrate(minOf(MAX_BITRATE, (cur * 1.25).toInt()))
+                }
+            }
+        }
+    }
+
+    /** 动态调整编码码率(MediaCodec 立即生效,下一帧开始按新码率编码) */
+    private fun setEncoderBitrate(bps: Int) {
+        if (bps == currentBitrate) return
+        try {
+            val params = android.os.Bundle()
+            params.putInt(MediaCodec.PARAMETER_KEY_BITRATE, bps)
+            encoder?.setParameters(params)
+            currentBitrate = bps
+            Log.i(TAG, "自适应码率:${bps / 1000} kbps")
+        } catch (e: Exception) {
+            Log.w(TAG, "调整码率失败: ${e.message}")
+        }
     }
 
     /** 请求编码器下一帧为关键帧(I帧),用于首帧快速出画面和重连后恢复 */
@@ -271,6 +442,10 @@ class ScreenCastService : Service() {
         return Pair(nw, nh)
     }
 
+    /** JSON 字符串转义(设备型号里可能含引号/反斜杠) */
+    private fun jsonEscape(s: String): String =
+        s.replace("\\", "\\\\").replace("\"", "\\\"")
+
     private fun updateStatus(text: String) {
         statusText = text
         Log.i(TAG, "状态:$text")
@@ -285,6 +460,7 @@ class ScreenCastService : Service() {
         try { encoder?.release() } catch (_: Exception) {}
         try { projection?.stop() } catch (_: Exception) {}
         socket?.close()
+        try { wakeLock?.release() } catch (_: Exception) {}
         updateStatus("已停止")
         super.onDestroy()
     }
