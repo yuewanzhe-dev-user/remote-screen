@@ -246,11 +246,41 @@ class RtcClient(
             }
         )
 
+        // 读屏幕真实分辨率
+        val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
+        val metrics = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        wm.defaultDisplay.getRealMetrics(metrics)
+        val cw = if (metrics.widthPixels % 2 == 0) metrics.widthPixels else metrics.widthPixels - 1
+        val ch = if (metrics.heightPixels % 2 == 0) metrics.heightPixels else metrics.heightPixels - 1
+        Log.i(TAG, "屏幕分辨率: ${metrics.widthPixels}x${metrics.heightPixels},抓屏 ${cw}x${ch}")
+
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
-        // isScreencast=true:让编码器走屏幕共享模式(高分辨率优先,而非摄像头的高帧率优先)
+        // isScreencast=true:屏幕共享模式
         videoSource = factory!!.createVideoSource(/* isScreencast = */ true)
-        videoCapturer!!.initialize(surfaceHelper, context, videoSource!!.capturerObserver)
-        videoCapturer!!.startCapture(WIDTH, HEIGHT, FPS)
+
+        // 关键诊断:包装 capturerObserver,统计抓到的帧数
+        // 如果帧数一直是 0,说明 ScreenCapturerAndroid 没抓到画面(MediaProjection 没真正启动)
+        val rawObserver = videoSource!!.capturerObserver
+        val frameCounter = java.util.concurrent.atomic.AtomicInteger(0)
+        val wrappedObserver = object : org.webrtc.CapturerObserver {
+            override fun onCapturerStarted(success: Boolean) {
+                Log.i(TAG, "🎯 抓屏已启动 success=$success")
+                rawObserver.onCapturerStarted(success)
+            }
+            override fun onCapturerStopped() { rawObserver.onCapturerStopped() }
+            override fun onFrameCaptured(frame: org.webrtc.VideoFrame?) {
+                val n = frameCounter.incrementAndGet()
+                if (n <= 3 || n % 100 == 0) {
+                    Log.i(TAG, "🎥 抓到第 $n 帧 ${frame?.rotatedWidth}x${frame?.rotatedHeight}")
+                }
+                rawObserver.onFrameCaptured(frame)
+            }
+        }
+
+        videoCapturer!!.initialize(surfaceHelper, context, wrappedObserver)
+        videoCapturer!!.startCapture(cw, ch, FPS)
+        Log.i(TAG, "startCapture 已调用,等待 🎯 抓屏已启动 日志")
 
         videoTrack = factory!!.createVideoTrack(VIDEO_TRACK_ID, videoSource)
         videoTrack!!.setEnabled(true)
