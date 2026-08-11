@@ -40,6 +40,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private var discovery: BoardDiscovery? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    // 上次展示的黑板列表,黑板每 2 秒广播一次,只在真正变化时才重建 ListView
+    private var lastBoardNames: List<String>? = null
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -100,6 +102,9 @@ class MainActivity : AppCompatActivity() {
         discovery = BoardDiscovery(this)
         discovery?.startDiscovery { boards ->
             mainHandler.post {
+                val names = boards.map { "${it.name} (${it.host})" }
+                if (names == lastBoardNames) return@post
+                lastBoardNames = names
                 tvBoardsHint.text =
                     if (boards.isEmpty()) "未发现黑板,可手输 IP"
                     else "发现 ${boards.size} 块黑板,点击投屏:"
