@@ -60,10 +60,11 @@
   </div>
 
   <script>
-    // 从 URL 读取房间号: http://host:8080/?room=三年二班
+    // 房间号:与 exe 默认一致,学生无感;URL 可覆盖
     const params = new URLSearchParams(location.search);
     const room = params.get("room") || "default";
-    document.getElementById("roomTag").textContent = "房间:" + room;
+    document.getElementById("roomTag").textContent = "等待学生/老师投屏";
+    document.title = "智慧投屏";
 
     const video = document.getElementById("video");
     const dot = document.getElementById("dot");
@@ -77,14 +78,25 @@
       dot.className = "dot " + (kind || "");
     }
 
-    // WebSocket 连信令服务器
+    // 启动时拉一下黑板名(可选)
+    fetch("/api/info").then(r => r.json()).then(info => {
+      if (info && info.name) {
+        document.title = "智慧投屏 - " + info.name;
+        document.getElementById("roomTag").textContent = info.name + " · 等待投屏";
+      }
+    }).catch(() => {});
+
+    // WebSocket 连本机信令
     const wsUrl = "ws://" + location.host + "/ws?room=" + encodeURIComponent(room) + "&role=browser";
     let ws;
     function connectWs() {
       ws = new WebSocket(wsUrl);
-      ws.onopen = () => setStatus("已连接信令,等待 pad 投屏…", "wait");
+      ws.onopen = () => {
+        setStatus("已就绪,等待 pad 投屏…", "wait");
+        waitText.textContent = "等待 pad 投屏…";
+      };
       ws.onclose = () => {
-        setStatus("与信仟服务器断开,3 秒后重连", "err");
+        setStatus("与信令断开,3 秒后重连", "err");
         setTimeout(connectWs, 3000);
       };
       ws.onerror = () => setStatus("连接出错", "err");
@@ -253,8 +265,20 @@
           waitText.textContent = "pad 已断开,等待重新投屏…";
           resetPc();
         } else if (msg.type === "joined") {
-          if (msg.peerOnline) setStatus("已连接信令,pad 在线,等待画面…", "wait");
-          else setStatus("已连接信令,等待 pad 投屏…", "wait");
+          if (msg.boardName) {
+            document.title = "智慧投屏 - " + msg.boardName;
+            document.getElementById("roomTag").textContent = msg.boardName + " · 等待投屏";
+          }
+          if (msg.peerOnline) {
+            setStatus("pad 在线,等待画面…", "wait");
+            waitText.textContent = "pad 在线,正在建立画面…";
+          } else {
+            setStatus("已就绪,等待 pad 投屏…", "wait");
+            waitText.textContent = "等待 pad 投屏…";
+          }
+        } else if (msg.type === "peer-online") {
+          setStatus("pad 已连接,等待画面…", "wait");
+          waitText.textContent = "pad 已连接,正在建立画面…";
         }
       } catch (err) {
         console.error("[webrtc] 协商出错", err);
