@@ -137,11 +137,17 @@ class RtcClient(
                     val peerOnline = json.optBoolean("peerOnline")
                     Log.i(TAG, "已加入房间,浏览器在线:$peerOnline")
                     if (peerOnline) {
-                        // 浏览器在等我们的 offer,立即发起
+                        // pad 后连:浏览器在等我们的 offer,立即发起
                         createOffer()
                     } else {
                         updateStatus("已连信令,等待浏览器打开…")
                     }
+                }
+                "peer-online" -> {
+                    // pad 先连时,浏览器后进来,服务器通知我们"对方上线了"
+                    // 这时 pad 要主动 createOffer(否则死锁:浏览器等 offer,pad 等浏览器)
+                    Log.i(TAG, "浏览器已上线,发起 offer")
+                    createOffer()
                 }
                 "answer" -> {
                     // 浏览器回的 answer
