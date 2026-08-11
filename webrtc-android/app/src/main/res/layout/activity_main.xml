@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="智慧投屏 (WebRTC)"
+        android:textSize="22sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="信令服务器地址(如 192.168.1.100:8080)"
+        android:textColor="#999"
+        android:textSize="12sp" />
+
+    <EditText
+        android:id="@+id/etServer"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="信令服务器 IP:端口"
+        android:inputType="text" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="房间号(黑板编号,如 三年二班)"
+        android:textColor="#999"
+        android:textSize="12sp"
+        android:layout_marginTop="12dp" />
+
+    <EditText
+        android:id="@+id/etRoom"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="房间号"
+        android:inputType="text" />
+
+    <Button
+        android:id="@+id/btnStart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="开始投屏"
+        android:layout_marginTop="20dp" />
+
+    <Button
+        android:id="@+id/btnStop"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="停止投屏"
+        android:enabled="false" />
+
+    <TextView
+        android:id="@+id/tvStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="状态:未连接"
+        android:layout_marginTop="20dp"
+        android:textSize="14sp" />
+
+</LinearLayout>
