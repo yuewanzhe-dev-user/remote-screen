@@ -59,12 +59,20 @@ class ScreenCastService : Service() {
         // 获取保活锁
         acquireLocks()
 
+        // 先停掉旧客户端,避免重复点投屏叠多个连接
+        try { rtcClient?.stop() } catch (_: Exception) {}
+        rtcClient = null
+
         // 启动 RtcClient(在主线程构造,内部自己切线程)
         try {
             statusText = "启动中…"
             rtcClient = RtcClient(this, data, server, room) { status ->
                 statusText = status
                 onStatusChange?.invoke(status)
+                // 被顶替后自动结束前台服务
+                if (status.contains("已被其他") || status.contains("投屏被系统停止")) {
+                    stopSelf()
+                }
             }
             rtcClient?.start()
         } catch (e: Exception) {
