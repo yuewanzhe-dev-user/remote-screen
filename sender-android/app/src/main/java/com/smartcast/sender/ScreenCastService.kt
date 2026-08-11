@@ -221,15 +221,19 @@ class ScreenCastService : Service() {
      * 保证任何 pad 都能出画面,只是部分设备延迟略高。
      */
     private fun createEncoder(w: Int, h: Int): MediaCodec? {
-        val configs = listOf(enhancedFormat(w, h), basicFormat(w, h), minimalFormat(w, h))
-        for (format in configs) {
+        val configs = listOf(
+            "增强(关B帧+低延迟)" to enhancedFormat(w, h),
+            "基础(VBR)" to basicFormat(w, h),
+            "最简(默认)" to minimalFormat(w, h)
+        )
+        for ((desc, format) in configs) {
             try {
                 val codec = MediaCodec.createEncoderByType("video/avc") ?: continue
                 codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                Log.i(TAG, "编码器配置成功: ${format.keySet()}")
+                Log.i(TAG, "编码器配置成功: $desc")
                 return codec
             } catch (e: Exception) {
-                Log.w(TAG, "编码器配置失败,尝试下一档配置: ${e.message}")
+                Log.w(TAG, "编码器配置失败($desc),尝试下一档: ${e.message}")
             }
         }
         return null
