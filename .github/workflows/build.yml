@@ -1,63 +1,137 @@
-name: 构建 pad 端 APK 和黑板端 EXE
+name: 构建
 
 # 触发:push 到 main,或网页手动 Run workflow
 on:
   push:
     branches: [main]
+    paths:
+      # 任意一个端目录或本配置改动都触发(具体哪个 job 跑由下方 paths 过滤决定)
+      - 'sender-android/**'
+      - 'receiver-windows/**'
+      - 'webrtc-android/**'
+      - 'signaling-go/**'
+      - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      target:
+        description: '指定构建目标(all/pad/exe/webrtc/signaling),留空=全部'
+        required: false
+        default: 'all'
 
+# 一个 push 同时触发的 job,默认并行跑
 jobs:
-  # ============ 任务一:编译 pad 端 Android APK ============
-  build-android:
+
+  # ============ TCP 方案:pad 端 APK ============
+  # 只在 sender-android/ 或 workflow 本身改动时跑
+  build-pad:
+    name: 构建 pad 端 APK (TCP)
     runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'pad') ||
+      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
+      - name: 检查是否需要构建(路径过滤)
+        id: check
+        run: |
+          # 手动触发时强制构建;push 时只在 sender-android 或 workflow 改动才构建
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            # before 可能是全零(首次推送),用兜底方式取改动文件
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              FILES=$(git ls-files)
+            else
+              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
+            fi
+            if echo "$FILES" | grep -qE '^(sender-android/|\.github/workflows/)'; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "检测到 pad 端改动,开始构建"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "本次未改动 pad 端,跳过"
+            fi
+          fi
+
       - name: 安装 JDK 17
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: 设置 Android SDK
+        if: steps.check.outputs.skip != 'true'
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
       - name: 下载 Gradle 8.5 并生成 Wrapper
+        if: steps.check.outputs.skip != 'true'
         working-directory: sender-android
         run: |
-          # 下载 Gradle 8.5(系统自带的是 9.x,和 AGP 8.1.4 不兼容,必须用 8.x)
           wget -q https://services.gradle.org/distributions/gradle-8.5-bin.zip
           unzip -q gradle-8.5-bin.zip
           ./gradle-8.5/bin/gradle wrapper --gradle-version 8.5
           chmod +x gradlew
 
-      # 测试阶段构建 debug 版:自带调试签名,能直接安装,不会报 PackageInfo is null
-      # 正式上线给厂商推送前,再配置正式签名
       - name: 编译 Debug APK
+        if: steps.check.outputs.skip != 'true'
         working-directory: sender-android
         run: ./gradlew assembleDebug --no-daemon
 
       - name: 上传 APK
+        if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: 智慧投屏-pad端-apk
           path: sender-android/app/build/outputs/apk/debug/*.apk
           retention-days: 30
 
-  # ============ 任务二:编译黑板端 Windows EXE ============
-  build-windows:
+  # ============ TCP 方案:黑板端 EXE ============
+  # 只在 receiver-windows/ 或 workflow 本身改动时跑
+  build-exe:
+    name: 构建黑板端 EXE (TCP)
     runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'exe') ||
+      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
+      - name: 检查是否需要构建(路径过滤)
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              FILES=$(git ls-files)
+            else
+              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
+            fi
+            if echo "$FILES" | grep -qE '^(receiver-windows/|\.github/workflows/)'; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "检测到黑板端改动,开始构建"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "本次未改动黑板端,跳过"
+            fi
+          fi
+
       - name: 安装 Go
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
-      - name: 交叉编译为 Windows EXE(纯标准库,无需下载依赖)
+      - name: 交叉编译为 Windows EXE
+        if: steps.check.outputs.skip != 'true'
         working-directory: receiver-windows/go
         env:
           GOOS: windows
@@ -66,8 +140,149 @@ jobs:
         run: go build -ldflags="-s -w" -o 投屏接收端.exe main.go
 
       - name: 上传 EXE
+        if: steps.check.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: 智慧投屏-黑板端-exe
           path: receiver-windows/go/投屏接收端.exe
+          retention-days: 30
+
+  # ============ WebRTC 方案:pad 端 APK ============
+  # 只在 webrtc-android/ 或 workflow 本身改动时跑
+  build-webrtc-pad:
+    name: 构建 pad 端 APK (WebRTC)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'webrtc') ||
+      github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查是否需要构建(路径过滤 + 目录是否存在)
+        id: check
+        run: |
+          # webrtc-android 目录还没建,先检查存在性
+          if [[ ! -d "webrtc-android" ]] || [[ -z "$(ls -A webrtc-android/ 2>/dev/null)" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "webrtc-android 目录为空,跳过(代码尚未编写)"
+            exit 0
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              FILES=$(git ls-files)
+            else
+              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
+            fi
+            if echo "$FILES" | grep -qE '^(webrtc-android/|\.github/workflows/)'; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "检测到 WebRTC pad 端改动,开始构建"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "本次未改动 WebRTC pad 端,跳过"
+            fi
+          fi
+
+      - name: 安装 JDK 17
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 设置 Android SDK
+        if: steps.check.outputs.skip != 'true'
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: 下载 Gradle 8.5 并生成 Wrapper
+        if: steps.check.outputs.skip != 'true'
+        working-directory: webrtc-android
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.5-bin.zip
+          unzip -q gradle-8.5-bin.zip
+          ./gradle-8.5/bin/gradle wrapper --gradle-version 8.5
+          chmod +x gradlew
+
+      - name: 编译 Debug APK
+        if: steps.check.outputs.skip != 'true'
+        working-directory: webrtc-android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: 上传 APK
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 智慧投屏-WebRTC版-apk
+          path: webrtc-android/app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+  # ============ WebRTC 方案:信令服务器 EXE ============
+  # 只在 signaling-go/ 或 workflow 本身改动时跑
+  build-signaling:
+    name: 构建信令服务器 EXE (WebRTC)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      (github.event.inputs.target == 'all' || github.event.inputs.target == 'signaling') ||
+      github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查是否需要构建
+        id: check
+        run: |
+          if [[ ! -d "signaling-go" ]] || [[ -z "$(ls -A signaling-go/ 2>/dev/null)" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "signaling-go 目录为空,跳过"
+            exit 0
+          fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            BEFORE="${{ github.event.before }}"
+            if [[ "$BEFORE" =~ ^0+$ ]]; then
+              FILES=$(git ls-files)
+            else
+              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
+            fi
+            if echo "$FILES" | grep -qE '^(signaling-go/|\.github/workflows/)'; then
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "检测到信令服务器改动,开始构建"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT
+              echo "本次未改动信令服务器,跳过"
+            fi
+          fi
+
+      - name: 安装 Go
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: 下载依赖
+        if: steps.check.outputs.skip != 'true'
+        working-directory: signaling-go
+        run: go mod download
+
+      - name: 交叉编译为 Windows EXE (内嵌 HTML)
+        if: steps.check.outputs.skip != 'true'
+        working-directory: signaling-go
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o 信令服务器.exe main.go
+
+      - name: 上传 EXE
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: 智慧投屏-信令服务器-exe
+          path: signaling-go/信令服务器.exe
           retention-days: 30
