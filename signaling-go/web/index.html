@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>智慧投屏 - 黑板端</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: #000; overflow: hidden; font-family: -apple-system, "Microsoft YaHei", sans-serif; }
+    #video {
+      width: 100vw; height: 100vh; object-fit: contain;
+      background: #000; display: block;
+    }
+    /* 顶部状态条,鼠标移动时显示,几秒不动自动隐藏 */
+    #bar {
+      position: fixed; top: 0; left: 0; right: 0;
+      padding: 10px 16px;
+      background: rgba(0,0,0,0.6); color: #fff;
+      display: flex; align-items: center; gap: 12px;
+      font-size: 14px; transition: opacity 0.3s;
+    }
+    #bar.hide { opacity: 0; pointer-events: none; }
+    #status { flex: 1; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #888; display: inline-block; }
+    .dot.ok { background: #4caf50; }
+    .dot.err { background: #f44336; }
+    .dot.wait { background: #ff9800; }
+    button {
+      background: #2196f3; color: #fff; border: 0;
+      padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px;
+    }
+    button:hover { background: #1976d2; }
+    /* 等待画面 */
+    #waiting {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; color: #888; gap: 16px;
+    }
+    #waiting.hide { display: none; }
+    .spinner {
+      width: 40px; height: 40px; border: 3px solid #333; border-top-color: #2196f3;
+      border-radius: 50%; animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .room-tag { font-size: 12px; color: #555; }
+  </style>
+</head>
+<body>
+  <video id="video" autoplay playsinline muted></video>
+
+  <div id="waiting">
+    <div class="spinner"></div>
+    <div id="waitText">正在连接信令服务器…</div>
+    <div class="room-tag" id="roomTag"></div>
+  </div>
+
+  <div id="bar">
+    <span class="dot wait" id="dot"></span>
+    <span id="status">连接中…</span>
+    <button id="fullBtn">全屏</button>
+  </div>
+
+  <script>
+    // 从 URL 读取房间号: http://host:8080/?room=三年二班
+    const params = new URLSearchParams(location.search);
+    const room = params.get("room") || "default";
+    document.getElementById("roomTag").textContent = "房间:" + room;
+
+    const video = document.getElementById("video");
+    const dot = document.getElementById("dot");
+    const statusEl = document.getElementById("status");
+    const waiting = document.getElementById("waiting");
+    const waitText = document.getElementById("waitText");
+    const bar = document.getElementById("bar");
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      dot.className = "dot " + (kind || "");
+    }
+
+    // WebSocket 连信令服务器
+    const wsUrl = "ws://" + location.host + "/ws?room=" + encodeURIComponent(room) + "&role=browser";
+    let ws;
+    function connectWs() {
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => setStatus("已连接信令,等待 pad 投屏…", "wait");
+      ws.onclose = () => {
+        setStatus("与信仟服务器断开,3 秒后重连", "err");
+        setTimeout(connectWs, 3000);
+      };
+      ws.onerror = () => setStatus("连接出错", "err");
+      ws.onmessage = onMessage;
+    }
+
+    // WebRTC
+    const pc = new RTCPeerConnection();
+    pc.ontrack = (e) => {
+      video.srcObject = e.streams[0];
+      waiting.classList.add("hide");
+      setStatus("投屏中", "ok");
+    };
+    pc.onicecandidate = (e) => {
+      if (e.candidate) send({ type: "ice", data: e.candidate });
+    };
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === "failed" || s === "disconnected") setStatus("连接异常:" + s, "err");
+      else if (s === "connected") setStatus("投屏中", "ok");
+    };
+
+    function send(msg) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    }
+
+    async function onMessage(event) {
+      const msg = JSON.parse(event.data);
+      try {
+        if (msg.type === "offer") {
+          await pc.setRemoteDescription(msg.data);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          send({ type: "answer", data: answer });
+          waitText.textContent = "已收到 pad 请求,正在建立连接…";
+        } else if (msg.type === "ice") {
+          await pc.addIceCandidate(msg.data).catch(() => {});
+        }
+      } catch (err) {
+        setStatus("协商出错:" + err.message, "err");
+      }
+    }
+
+    // 全屏按钮
+    document.getElementById("fullBtn").onclick = () => {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else document.documentElement.requestFullscreen();
+    };
+
+    // 状态条自动隐藏(3 秒不动鼠标)
+    let hideTimer;
+    document.addEventListener("mousemove", () => {
+      bar.classList.remove("hide");
+      clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => bar.classList.add("hide"), 3000);
+    });
+
+    connectWs();
+  </script>
+</body>
+</html>
