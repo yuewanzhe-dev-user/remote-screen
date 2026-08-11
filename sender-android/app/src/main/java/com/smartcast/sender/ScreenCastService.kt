@@ -80,6 +80,9 @@ class ScreenCastService : Service() {
         // 控制消息读超时:黑板端心跳 5 秒一条,连续 HEARTBEAT_MISS_LIMIT 次超时视为黑板失联
         private const val CONTROL_READ_TIMEOUT_MS = 5000
         private const val HEARTBEAT_MISS_LIMIT = 4
+        // 发送队列容量(帧数):超过则丢最旧的非关键帧,防止累积延迟
+        // 60 帧 ≈ 2 秒缓冲,正常网络下队列基本是空的,弱网时才会堆积触发丢帧
+        private const val MAX_QUEUE_FRAMES = 60
     }
 
     private var projection: MediaProjection? = null
@@ -102,6 +105,8 @@ class ScreenCastService : Service() {
     // 自适应码率:当前码率 + 累计已写字节数(由码率监控线程每 2 秒采样)
     @Volatile private var currentBitrate = INIT_BITRATE
     private val writtenBytes = AtomicLong(0)
+    // 丢帧计数(弱网时队列满丢弃的非关键帧,用于排障)
+    private val droppedFrames = AtomicLong(0)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -280,6 +285,11 @@ class ScreenCastService : Service() {
      *   - 黑板端发来 {"cmd":"kicked"}(被其他 pad 顶替)
      *   - 黑板端发来 {"cmd":"stop"}(黑板端结束投屏)
      * 兜底:连接后 3 秒内断开,多半是被顶替(兼容没有 kicked 消息的老黑板)。
+     *
+     * 防累积延迟(借鉴 scrcpy):
+     *   编码器输出 → 投入有界队列 → 发送线程异步写 socket。
+     *   队列满时丢弃最旧的非关键帧(P 帧),关键帧(I 帧)永远保留。
+     *   这样网络变慢时宁可掉几帧也不让延迟越积越大,避免"投得越久越卡"。
      */
     private fun streamLoopWithReconnect() {
         var retryCount = 0
@@ -306,7 +316,7 @@ class ScreenCastService : Service() {
                 out.write(header)
                 out.flush()
 
-                // 黑板端控制消息监听(kicked/stop/心跳),同时负责检测黑板端失联
+                // 黑板端控制消息监听(kicked/stop/心跳/reqkey),同时负责检测黑板端失联
                 startControlReader()
 
                 // 编码器已在 startCasting() 中启动,这里不重复 start
@@ -315,6 +325,24 @@ class ScreenCastService : Service() {
                 // 首帧请求:通过 PARAMETER_KEY_REQUEST_SYNC_FLAG 让下一帧为关键帧
                 // (每次连接后都请求一次,确保黑板端尽快解码出画面)
                 requestKeyFrame()
+
+                // 发送队列:有界,满时丢最旧的非关键帧。投递帧用这个,避免阻塞编码器
+                val sendQueue = java.util.concurrent.LinkedBlockingQueue<FrameData>(MAX_QUEUE_FRAMES)
+                // 每次重连新建一套发送线程,断开时通过 stopFlag 停止
+                val stopFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+
+                // 发送线程:从队列取帧写到 socket。阻塞在 write 上时,丢帧策略已在入队时完成
+                val senderThread = thread(name = "smartcast-sender") {
+                    try {
+                        while (running && !stopFlag.get()) {
+                            val f = sendQueue.poll(50, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                            out!!.write(f.data, 0, f.size)
+                            writtenBytes.addAndGet(f.size.toLong())
+                        }
+                    } catch (e: Exception) {
+                        if (running && !stopFlag.get()) Log.w(TAG, "发送线程异常: ${e.message}")
+                    }
+                }
 
                 val bufferInfo = MediaCodec.BufferInfo()
                 Log.i(TAG, "开始推流 → $targetHost:$targetPort")
@@ -327,15 +355,33 @@ class ScreenCastService : Service() {
                             val data = ByteArray(bufferInfo.size)
                             buf.position(bufferInfo.offset)
                             buf.get(data, 0, bufferInfo.size)
-                            out.write(data, 0, bufferInfo.size)
-                            writtenBytes.addAndGet(bufferInfo.size.toLong())
                             codec.releaseOutputBuffer(outIndex, false)
+
+                            // 判断关键帧:H.264 码流中,NAL 起始码后第一个字节低 5 位为 5 即 IDR(I帧)
+                            val isKey = isKeyFrame(data)
+                            val frame = FrameData(data, bufferInfo.size, isKey)
+
+                            // 入队策略(防累积延迟的核心):
+                            //   - 关键帧:如果队列里有非关键帧,先清掉它们再入队
+                            //     (关键帧是新的解码基准,旧 P 帧没用了)
+                            //   - 非关键帧:队列满了直接丢(保住已入队的关键帧)
+                            if (isKey) {
+                                sendQueue.retainAll { it.isKey }
+                                sendQueue.offer(frame)
+                            } else {
+                                if (!sendQueue.offer(frame)) {
+                                    droppedFrames.incrementAndGet()
+                                }
+                            }
                         }
                         outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                             Log.i(TAG, "编码器输出格式已就绪")
                         }
                     }
                 }
+                // 主循环退出,等发送线程把剩余帧发完
+                stopFlag.set(true)
+                senderThread.join(1000)
             } catch (e: Exception) {
                 Log.w(TAG, "推流异常: ${e.message}")
                 connected = false
@@ -364,6 +410,37 @@ class ScreenCastService : Service() {
             }
         }
         stopSelf()
+    }
+
+    /** 一帧编码数据 + 是否关键帧 */
+    private class FrameData(data: ByteArray, val size: Int, val isKey: Boolean) {
+        // data 已在构造时拷贝,这里持有引用
+        val data: ByteArray = data
+    }
+
+    /**
+     * 判断 H.264 帧是否为关键帧(IDR)。
+     * H.264 码流以 NAL 单元组成,起始码 00 00 00 01 或 00 00 01,
+     * 起始码后第一个字节:低 5 位 = 5 表示 IDR(I 帧),= 1 表示非 IDR(P/B 帧)。
+     */
+    private fun isKeyFrame(data: ByteArray): Boolean {
+        // 找起始码,最多看前 8 字节(MediaCodec 输出的每帧通常只有一个 NAL)
+        val len = minOf(data.size, 8)
+        var i = 0
+        while (i < len) {
+            if (i + 3 < data.size && data[i] == 0.toByte() && data[i + 1] == 0.toByte()
+                && data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte()
+            ) {
+                return data.size > i + 4 && (data[i + 4].toInt() and 0x1f) == 5
+            }
+            if (i + 2 < data.size && data[i] == 0.toByte() && data[i + 1] == 0.toByte()
+                && data[i + 2] == 1.toByte()
+            ) {
+                return data.size > i + 3 && (data[i + 3].toInt() and 0x1f) == 5
+            }
+            i++
+        }
+        return false
     }
 
     /**
@@ -425,6 +502,11 @@ class ScreenCastService : Service() {
                                 try { s.close() } catch (_: Exception) {}
                                 break
                             }
+                            "reqkey" -> {
+                                // 黑板端解码出错(丢包/花屏),请求立即补一个关键帧恢复画面
+                                // 借鉴 scrcpy:解码端报错时主动要 I 帧,而不是干等 2 秒
+                                requestKeyFrame()
+                            }
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "控制消息解析失败: $line")
@@ -460,6 +542,11 @@ class ScreenCastService : Service() {
                         setEncoderBitrate(maxOf(MIN_BITRATE, (cur * 0.8).toInt()))
                     rateBps > (cur * 0.95).toLong() && cur < MAX_BITRATE ->
                         setEncoderBitrate(minOf(MAX_BITRATE, (cur * 1.25).toInt()))
+                }
+                // 丢帧统计:有丢帧说明网络拥塞,方便排障
+                val dropped = droppedFrames.getAndSet(0)
+                if (dropped > 0) {
+                    Log.w(TAG, "近 2 秒丢帧 $dropped 帧(弱网丢 P 帧保延迟)")
                 }
             }
         }
