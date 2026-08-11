@@ -45,6 +45,8 @@ class RtcClient(
     private val mediaProjectionPermissionData: Intent,
     private val serverHost: String,
     private val room: String,
+    /** 可选;空字符串=不带 token(默认,一键连接) */
+    private val token: String = "",
     private val onStatus: (String) -> Unit
 ) {
     companion object {
@@ -140,7 +142,11 @@ class RtcClient(
 
     private fun connectSignaling() {
         if (!running || kicked) return
-        val uri = URI("ws://$serverHost/ws?room=${java.net.URLEncoder.encode(room, "UTF-8")}&role=pad")
+        var qs = "room=${java.net.URLEncoder.encode(room, "UTF-8")}&role=pad"
+        if (token.isNotEmpty()) {
+            qs += "&token=${java.net.URLEncoder.encode(token, "UTF-8")}"
+        }
+        val uri = URI("ws://$serverHost/ws?$qs")
         Log.i(TAG, "连接信令服务器: $uri")
         updateStatus("连接信令服务器…")
 
@@ -269,8 +275,13 @@ class RtcClient(
                     updateStatus("浏览器已断开,等待重新打开…")
                     executor.execute { releasePeerOnly() }
                 }
-                "kicked" -> {
-                    handleKicked("信令通知")
+                "kicked", "stop" -> {
+                    val reason = json.optString("reason")
+                    if (reason.contains("teacher")) {
+                        handleKicked("教师断开", userMessage = "教师已断开投屏")
+                    } else {
+                        handleKicked("信令通知", userMessage = "已被其他设备投屏替换")
+                    }
                 }
                 "pong", "ping" -> {
                     // 忽略
@@ -281,15 +292,15 @@ class RtcClient(
         }
     }
 
-    /** 被顶替:立刻停轨+关 PC,禁止重连 */
-    private fun handleKicked(from: String) {
-        Log.w(TAG, "被顶替($from),停止推流且禁止重连")
+    /** 被顶替/教师断开:立刻停轨+关 PC,禁止重连 */
+    private fun handleKicked(from: String, userMessage: String = "已被其他设备投屏替换") {
+        Log.w(TAG, "被断开($from),停止推流且禁止重连")
         kicked = true
         running = false
         mainHandler.removeCallbacksAndMessages(null)
         stopHeartbeat()
         stopStats()
-        updateStatus("已被其他设备投屏替换")
+        updateStatus(userMessage)
         // 同步尽快停轨,避免旧画面继续推到黑板
         try { videoTrack?.setEnabled(false) } catch (_: Exception) {}
         try { videoSender?.setTrack(null, false) } catch (_: Exception) {}

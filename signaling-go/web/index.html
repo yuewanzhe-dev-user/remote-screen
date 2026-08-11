@@ -56,6 +56,7 @@
   <div id="bar">
     <span class="dot wait" id="dot"></span>
     <span id="status">连接中…</span>
+    <button id="stopCastBtn" title="断开当前学生/老师投屏">断开投屏</button>
     <button id="fullBtn">全屏</button>
   </div>
 
@@ -63,6 +64,8 @@
     // 房间号:与 exe 默认一致,学生无感;URL 可覆盖
     const params = new URLSearchParams(location.search);
     const room = params.get("room") || "default";
+    // token 可选:仅 exe 启用 token 时 URL 会带上;默认无,不影响自动连接
+    const token = params.get("token") || "";
     document.getElementById("roomTag").textContent = "等待学生/老师投屏";
     document.title = "智慧投屏";
 
@@ -87,7 +90,8 @@
     }).catch(() => {});
 
     // WebSocket 连本机信令
-    const wsUrl = "ws://" + location.host + "/ws?room=" + encodeURIComponent(room) + "&role=browser";
+    let wsUrl = "ws://" + location.host + "/ws?room=" + encodeURIComponent(room) + "&role=browser";
+    if (token) wsUrl += "&token=" + encodeURIComponent(token);
     let ws;
     function connectWs() {
       ws = new WebSocket(wsUrl);
@@ -328,6 +332,10 @@
           waiting.classList.remove("hide");
           setStatus("pad 已连接,等待画面…", "wait");
           waitText.textContent = "pad 已连接,正在建立画面…";
+        } else if (msg.type === "teacher-stop-ok") {
+          setStatus(msg.message || "已处理断开", "wait");
+          waiting.classList.remove("hide");
+          waitText.textContent = msg.message || "等待 pad 投屏…";
         }
       } catch (err) {
         console.error("[webrtc] 协商出错", err);
@@ -335,6 +343,20 @@
         resetPc();
       }
     }
+
+    // 教师:断开当前投屏
+    document.getElementById("stopCastBtn").onclick = () => {
+      if (!confirm("确定断开当前 pad 投屏？")) return;
+      send({ type: "teacher-stop" });
+      // 兜底 HTTP(WebSocket 异常时)
+      fetch("/api/stop" + (token ? ("?token=" + encodeURIComponent(token)) : ""), { method: "POST" })
+        .then(r => r.json()).then(j => console.log("[teacher-stop]", j))
+        .catch(() => {});
+      resetPc();
+      waiting.classList.remove("hide");
+      waitText.textContent = "已请求断开,等待 pad 投屏…";
+      setStatus("已请求断开投屏", "wait");
+    };
 
     // 全屏按钮
     document.getElementById("fullBtn").onclick = () => {

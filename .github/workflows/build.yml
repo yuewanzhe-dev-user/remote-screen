@@ -200,7 +200,8 @@ jobs:
         working-directory: signaling-go
         run: go mod tidy
 
-      - name: 交叉编译为 Windows EXE (内嵌 HTML)
+      # go-webview2 为纯 Go + Win32,交叉编译 CGO_ENABLED=0 即可
+      - name: 交叉编译为 Windows EXE (内嵌 HTML + WebView2)
         if: steps.exists.outputs.has == 'true'
         working-directory: signaling-go
         env:

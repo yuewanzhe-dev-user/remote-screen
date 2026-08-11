@@ -16,10 +16,13 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
 
 /**
  * 主界面:自动发现黑板 → 点一下投屏。
- * 高级设置里可手输 IP/房间(搜不到时兜底)。
+ * - 历史投过的黑板置顶
+ * - 列表展示教室名(串班区分)
+ * - 发现带 token 时自动携带(默认无 token,不影响一键)
  */
 class MainActivity : AppCompatActivity() {
 
@@ -41,9 +44,10 @@ class MainActivity : AppCompatActivity() {
     private var discoveryStartedAt = 0L
     private val isolationHintRunnable = Runnable { showIsolationHintIfNeeded() }
 
-    // 即将投屏的目标(发现点选 或 手输)
     private var pendingServer: String = ""
     private var pendingRoom: String = "default"
+    private var pendingToken: String = ""
+    private var pendingBoardName: String = ""
 
     private val projectionManager by lazy {
         getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -92,6 +96,8 @@ class MainActivity : AppCompatActivity() {
             }
             pendingServer = server
             pendingRoom = room
+            pendingToken = prefs.getString("token", "") ?: ""
+            pendingBoardName = prefs.getString("last_board_name", "") ?: ""
             prefs.edit().putString("server", server).putString("room", room).apply()
             captureLauncher.launch(projectionManager.createScreenCaptureIntent())
         }
@@ -108,28 +114,23 @@ class MainActivity : AppCompatActivity() {
         tvBoardsHint.text = "正在搜索本教室黑板…"
         discoveryStartedAt = System.currentTimeMillis()
         mainHandler.removeCallbacks(isolationHintRunnable)
-        // 8 秒仍无黑板 → 明确提示客户端隔离/同 WiFi
         mainHandler.postDelayed(isolationHintRunnable, 8_000)
-        // 20 秒再强调一次
         mainHandler.postDelayed(isolationHintRunnable, 20_000)
 
         discovery = BoardDiscovery(this)
         discovery?.startDiscovery { boards ->
             mainHandler.post {
-                latestBoards = boards
-                val names = boards.map { "${it.name}  (${it.host}:${it.port})" }
+                val sorted = sortBoards(boards)
+                latestBoards = sorted
+                val names = sorted.map { formatBoardLine(it) }
                 if (names == lastBoardNames) return@post
                 lastBoardNames = names
-                if (boards.isNotEmpty()) {
+                if (sorted.isNotEmpty()) {
                     mainHandler.removeCallbacks(isolationHintRunnable)
-                    tvBoardsHint.text = "发现 ${boards.size} 块黑板,点击即可投屏:"
+                    tvBoardsHint.text = "发现 ${sorted.size} 块黑板,点击即可投屏(★=本机投过):"
                 } else {
                     val waited = System.currentTimeMillis() - discoveryStartedAt
-                    tvBoardsHint.text = if (waited >= 8_000) {
-                        isolationHintText()
-                    } else {
-                        "正在搜索本教室黑板…"
-                    }
+                    tvBoardsHint.text = if (waited >= 8_000) isolationHintText() else "正在搜索本教室黑板…"
                 }
                 lvBoards.adapter = ArrayAdapter(
                     this@MainActivity,
@@ -140,16 +141,57 @@ class MainActivity : AppCompatActivity() {
                     val board = latestBoards.getOrNull(position) ?: return@setOnItemClickListener
                     pendingServer = "${board.host}:${board.port}"
                     pendingRoom = board.room.ifEmpty { "default" }
+                    pendingToken = board.token
+                    pendingBoardName = board.name
                     etServer.setText(pendingServer)
                     etRoom.setText(pendingRoom)
                     prefs.edit()
                         .putString("server", pendingServer)
                         .putString("room", pendingRoom)
+                        .putString("token", pendingToken)
+                        .putString("last_board_name", board.name)
                         .apply()
                     captureLauncher.launch(projectionManager.createScreenCaptureIntent())
                 }
             }
         }
+    }
+
+    /** 历史黑板置顶 + 同网段优先 */
+    private fun sortBoards(boards: List<BoardDiscovery.Board>): List<BoardDiscovery.Board> {
+        val history = loadHistoryNames()
+        return boards.sortedWith(
+            compareByDescending<BoardDiscovery.Board> { history.indexOf(it.name).let { i -> if (i >= 0) 1000 - i else -1 } }
+                .thenBy { it.name }
+        )
+    }
+
+    private fun formatBoardLine(b: BoardDiscovery.Board): String {
+        val hist = loadHistoryNames()
+        val star = if (hist.contains(b.name)) "★ " else ""
+        // 串班区分:名称在前(大字视觉靠排序+★),IP 在后
+        return "$star${b.name}  ·  ${b.host}:${b.port}"
+    }
+
+    private fun loadHistoryNames(): List<String> {
+        return try {
+            val raw = prefs.getString("board_history", "[]") ?: "[]"
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { arr.getString(it) }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun rememberBoard(name: String) {
+        if (name.isBlank()) return
+        val list = loadHistoryNames().toMutableList()
+        list.remove(name)
+        list.add(0, name)
+        while (list.size > 8) list.removeAt(list.lastIndex)
+        val arr = JSONArray()
+        list.forEach { arr.put(it) }
+        prefs.edit().putString("board_history", arr.toString()).apply()
     }
 
     private fun isolationHintText(): String {
@@ -162,7 +204,6 @@ class MainActivity : AppCompatActivity() {
     private fun showIsolationHintIfNeeded() {
         if (latestBoards.isNotEmpty()) return
         tvBoardsHint.text = isolationHintText()
-        // 同时把状态栏也提示一下
         if (!btnStop.isEnabled) {
             tvStatus.text = "状态:未发现黑板,检查同网/客户端隔离"
         }
@@ -171,16 +212,19 @@ class MainActivity : AppCompatActivity() {
     private fun startCastService(resultCode: Int, data: Intent) {
         val server = pendingServer.ifEmpty { etServer.text.toString().trim() }
         val room = pendingRoom.ifEmpty { etRoom.text.toString().trim().ifEmpty { "default" } }
+        val token = pendingToken
         if (server.isEmpty()) {
             Toast.makeText(this, "未选择黑板", Toast.LENGTH_SHORT).show()
             return
         }
-        // 直接 start;Service.onStartCommand 里会先 stop 旧 RtcClient
+        if (pendingBoardName.isNotEmpty()) rememberBoard(pendingBoardName)
+
         val intent = Intent(this, ScreenCastService::class.java).apply {
             putExtra(ScreenCastService.EXTRA_RESULT_CODE, resultCode)
             putExtra(ScreenCastService.EXTRA_RESULT_DATA, data)
             putExtra(ScreenCastService.EXTRA_SERVER, server)
             putExtra(ScreenCastService.EXTRA_ROOM, room)
+            putExtra(ScreenCastService.EXTRA_TOKEN, token)
         }
         startForegroundService(intent)
         updateUi(true, "启动中…")
@@ -199,7 +243,8 @@ class MainActivity : AppCompatActivity() {
                 tvStatus.text = "状态:$status"
                 val stopped = status == "未连接" || status == "已停止" ||
                     status.startsWith("已停止") || status.startsWith("未授权") ||
-                    status.startsWith("启动失败") || status.contains("已被其他")
+                    status.startsWith("启动失败") || status.contains("已被其他") ||
+                    status.contains("教师已断开")
                 btnStart.isEnabled = stopped
                 btnStop.isEnabled = !stopped
             }
