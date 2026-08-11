@@ -115,3 +115,4 @@ scrcpy-smart/
 | pad 显示"已被其他投屏替换" | 正常,有其他 pad 顶掉了本次投屏 |
 | pad 显示"黑板端已结束投屏" | 正常,老师关掉了黑板画面窗口,重新点投屏即可 |
 | pad 显示"黑板端失联,正在重连…" | 黑板电脑关机/断网了,恢复后自动重连 |
+| pad 点投屏授权后闪退 | 多为个别国产 ROM 编码器不兼容扩展参数(MediaCodec configure 抛 IllegalArgumentException)。已做多级配置回退 + 防崩溃兜底;若仍闪退,`adb logcat -s ScreenCastService` 看日志 |
