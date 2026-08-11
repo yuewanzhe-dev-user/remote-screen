@@ -33,7 +33,8 @@ class BoardDiscovery(private val context: Context) {
     data class Board(
         val name: String,
         val host: String,
-        val port: Int
+        val port: Int,
+        val lastSeen: Long // 最后一次收到该黑板广播的时间,用于过期清理
     )
 
     private var socket: DatagramSocket? = null
@@ -65,8 +66,32 @@ class BoardDiscovery(private val context: Context) {
                 }
                 Log.i(TAG, "开始监听 UDP $DISCOVERY_PORT")
 
-                // 主动发一次查询,让黑板立刻回应(不用等它的下一次广播)
-                sendQuery()
+                // 主动发一次查询,让黑板立刻回应(不用等它的下一次广播)。
+                // 注意:查询必须从这个监听 socket 发,黑板才会单播回应到 19999 端口;
+                // 之前用临时端口发,回应会丢到已关闭的端口上,导致主动查询永远收不到。
+                try {
+                    val query = """{"cmd":"QUERY"}""".toByteArray()
+                    socket!!.send(
+                        DatagramPacket(query, query.size, InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT)
+                    )
+                    Log.i(TAG, "已发送查询广播")
+                } catch (e: Exception) {
+                    Log.w(TAG, "发送查询失败: ${e.message}")
+                }
+
+                // 黑板离线清理:黑板每 2 秒广播一次,连续 6 秒没收到就认为已下线
+                thread(name = "board-prune") {
+                    while (running) {
+                        try { Thread.sleep(3000) } catch (_: Exception) { break }
+                        val now = System.currentTimeMillis()
+                        val changed = synchronized(lock) {
+                            val before = foundBoards.size
+                            foundBoards.entries.removeAll { now - it.value.lastSeen > 6000 }
+                            foundBoards.size != before
+                        }
+                        if (changed) notifyFound()
+                    }
+                }
 
                 val buf = ByteArray(1024)
                 while (running) {
@@ -113,22 +138,24 @@ class BoardDiscovery(private val context: Context) {
             //   - 如果收到多个同名黑板,优先保留和自己同网段的
             //   - 不同网段的(如不可达的有线网卡地址)仅在没别的选择时才用
             synchronized(lock) {
+                val now = System.currentTimeMillis()
+                val board = Board(name, host, port, now)
                 val existing = foundBoards[name]
                 if (existing != null) {
                     val mySameSegment = sameSegment(host)
                     val existingSameSegment = sameSegment(existing.host)
                     when {
-                        // 新的和已知的都同网段,保留先到的(稳定)
-                        mySameSegment && existingSameSegment -> { /* 不覆盖 */ }
+                        // 新的和已知的都同网段,保留先到的(稳定),但要刷新 lastSeen
+                        mySameSegment && existingSameSegment -> foundBoards[name] = existing.copy(lastSeen = now)
                         // 新的同网段,旧的不同网段,用新的覆盖
-                        mySameSegment && !existingSameSegment -> foundBoards[name] = Board(name, host, port)
-                        // 新的不同网段,旧的同网段,保留旧的
-                        !mySameSegment && existingSameSegment -> { /* 不覆盖 */ }
+                        mySameSegment && !existingSameSegment -> foundBoards[name] = board
+                        // 新的不同网段,旧的同网段,保留旧的,但要刷新 lastSeen
+                        !mySameSegment && existingSameSegment -> foundBoards[name] = existing.copy(lastSeen = now)
                         // 两个都不同网段,用新的覆盖(随便选一个)
-                        else -> foundBoards[name] = Board(name, host, port)
+                        else -> foundBoards[name] = board
                     }
                 } else {
-                    foundBoards[name] = Board(name, host, port)
+                    foundBoards[name] = board
                 }
             }
             Log.i(TAG, "发现黑板: $name → $host:$port (同网段:${sameSegment(host)})")
@@ -195,25 +222,6 @@ class BoardDiscovery(private val context: Context) {
     private fun notifyFound() {
         val list = synchronized(lock) { foundBoards.values.toList() }
         onFound?.invoke(list)
-    }
-
-    /** 主动发一次查询广播,让黑板立即回应 */
-    private fun sendQuery() {
-        try {
-            thread(name = "board-query") {
-                val s = DatagramSocket().apply { broadcast = true }
-                val data = """{"cmd":"QUERY"}""".toByteArray()
-                val packet = DatagramPacket(
-                    data, data.size,
-                    InetAddress.getByName("255.255.255.255"), DISCOVERY_PORT
-                )
-                s.send(packet)
-                s.close()
-                Log.i(TAG, "已发送查询广播")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "发送查询失败: ${e.message}")
-        }
     }
 
     fun stopDiscovery() {
