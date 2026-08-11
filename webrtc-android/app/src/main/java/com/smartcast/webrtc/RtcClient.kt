@@ -246,14 +246,25 @@ class RtcClient(
             }
         )
 
-        // 读屏幕真实分辨率
+        // 读屏幕真实分辨率,但限制在 720p 以内(很多设备 H.264 硬编上限是 1080p,
+        // 2560x1600 这种平板分辨率会超出硬编能力,导致编码失败 → ICE 连上但黑屏)
         val wm = context.getSystemService(android.content.Context.WINDOW_SERVICE) as android.view.WindowManager
         val metrics = android.util.DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
-        val cw = if (metrics.widthPixels % 2 == 0) metrics.widthPixels else metrics.widthPixels - 1
-        val ch = if (metrics.heightPixels % 2 == 0) metrics.heightPixels else metrics.heightPixels - 1
-        Log.i(TAG, "屏幕分辨率: ${metrics.widthPixels}x${metrics.heightPixels},抓屏 ${cw}x${ch}")
+        // 等比缩放到 ≤ 720p
+        val maxW = 1280
+        val maxH = 720
+        var cw = metrics.widthPixels
+        var ch = metrics.heightPixels
+        if (cw > maxW || ch > maxH) {
+            val scale = minOf(maxW.toFloat() / cw, maxH.toFloat() / ch)
+            cw = (cw * scale).toInt()
+            ch = (ch * scale).toInt()
+        }
+        if (cw % 2 != 0) cw -= 1
+        if (ch % 2 != 0) ch -= 1
+        Log.i(TAG, "屏幕分辨率: ${metrics.widthPixels}x${metrics.heightPixels},抓屏缩放到 ${cw}x${ch}")
 
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
         // isScreencast=true:屏幕共享模式
@@ -301,6 +312,17 @@ class RtcClient(
             }
             peerConnection!!.createOffer(object : org.webrtc.SdpObserver {
                 override fun onCreateSuccess(desc: SessionDescription) {
+                    // 关键诊断:打印 offer 里协商的视频 codec
+                    // 如果没有 H264 也没有 VP8/VP9,说明编码器没就绪
+                    val sdp = desc.description
+                    val codecs = mutableSetOf<String>()
+                    val rtxmap = Regex("""a=rtpmap:(\d+) ([a-zA-Z0-9-]+)/""")
+                    for (m in rtxmap.findAll(sdp)) {
+                        codecs.add("${m.groupValues[1]}=${m.groupValues[2]}")
+                    }
+                    Log.i(TAG, "📋 offer 里的 codec: $codecs")
+                    Log.i(TAG, "📋 offer SDP 片段:\n${sdp.take(2000)}")
+
                     peerConnection!!.setLocalDescription(SimpleSdpObserver(), desc)
                     // 发 offer 给浏览器
                     val json = org.json.JSONObject()
