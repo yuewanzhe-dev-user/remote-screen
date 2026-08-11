@@ -83,6 +83,14 @@ wss.on("connection", (ws, req) => {
   const peerAlive = room[peerRole] && room[peerRole].readyState === room[peerRole].OPEN;
   ws.send(JSON.stringify({ type: "joined", room: roomName, role, peerOnline: !!peerAlive }));
 
+  // 关键修复:第二方加入时,通知已经在房间里的一方"对方上线了"
+  // 这样 pad(先连的)收到通知后,会主动 createOffer 发给浏览器,打破死锁
+  if (peerAlive) {
+    try {
+      room[peerRole].send(JSON.stringify({ type: "peer-online" }));
+    } catch (_) {}
+  }
+
   console.log(`[${new Date().toLocaleTimeString()}] ${role} 加入房间 "${roomName}"${peerAlive ? "(对方在线)" : "(等待对方)"}`);
 
   // 收到消息,转发给同房间另一端
