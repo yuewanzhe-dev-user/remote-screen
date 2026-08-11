@@ -95,6 +95,8 @@
     const pc = new RTCPeerConnection();
     pc.ontrack = (e) => {
       video.srcObject = e.streams[0];
+      // 显式 play,部分浏览器 autoplay 即使 muted 也不自动播
+      video.play().catch(() => {});
       waiting.classList.add("hide");
       setStatus("投屏中", "ok");
     };
