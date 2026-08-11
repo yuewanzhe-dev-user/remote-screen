@@ -83,7 +83,7 @@ class RtcClient(
             try { surfaceHelper?.dispose() } catch (_: Exception) {}
             try { peerConnection?.dispose() } catch (_: Exception) {}
             try { factory?.dispose() } catch (_: Exception) {}
-            try { eglBase?.dispose() } catch (_: Exception) {}
+            try { eglBase?.release() } catch (_: Exception) {}
             try { wsClient?.close() } catch (_: Exception) {}
             Log.i(TAG, "已释放所有资源")
         }
@@ -122,7 +122,7 @@ class RtcClient(
                 Log.e(TAG, "信令错误: ${e?.message}")
             }
         }
-        wsClient?.connectionTimeout = 5000
+        wsClient?.setConnectionLostTimeout(0) // 0=不启用自动断开检测,我们自己管理重连
         wsClient?.connect()
     }
 
@@ -280,7 +280,7 @@ class RtcClient(
 
                 override fun onSetSuccess() {}
                 override fun onSetFailure(error: String?) {}
-                override fun onFailure(error: String?) {
+                override fun onCreateFailure(error: String?) {
                     Log.e(TAG, "createOffer 失败: $error")
                     updateStatus("发起连接失败:$error")
                 }
@@ -335,7 +335,7 @@ class RtcClient(
     private class SimpleSdpObserver : org.webrtc.SdpObserver {
         override fun onCreateSuccess(p0: SessionDescription?) {}
         override fun onSetSuccess() {}
-        override fun onFailure(p0: String?) {}
+        override fun onCreateFailure(p0: String?) {}
         override fun onSetFailure(p0: String?) {}
     }
 }
