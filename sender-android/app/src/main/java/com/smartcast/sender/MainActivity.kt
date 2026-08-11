@@ -108,7 +108,6 @@ class MainActivity : AppCompatActivity() {
                 tvBoardsHint.text =
                     if (boards.isEmpty()) "未发现黑板,可手输 IP"
                     else "发现 ${boards.size} 块黑板,点击投屏:"
-                val names = boards.map { "${it.name} (${it.host})" }
                 lvBoards.adapter = ArrayAdapter(
                     this@MainActivity,
                     android.R.layout.simple_list_item_1, names
