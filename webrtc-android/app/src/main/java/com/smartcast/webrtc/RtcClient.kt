@@ -47,22 +47,49 @@ class RtcClient(
     private val room: String,
     /** 可选;空字符串=不带 token(默认,一键连接) */
     private val token: String = "",
+    /**
+     * 画质档位:
+     *  "720"  → 上限 1280x720
+     *  "1080" → 上限 1920x1080(默认,更清晰)
+     *  "native" → 尽量原分辨率(可能超硬编能力,风险高)
+     */
+    private val quality: String = "1080",
     private val onStatus: (String) -> Unit
 ) {
     companion object {
         private const val TAG = "RtcClient"
         private const val STREAM_ID = "smartcast-stream"
         private const val VIDEO_TRACK_ID = "smartcast-video"
-        private const val FPS = 20
-        /** 码率上下限(弱网自适应在此区间) */
-        private const val MAX_BITRATE_BPS = 2_500_000
-        private const val MIN_BITRATE_BPS = 600_000
-        private const val START_BITRATE_BPS = 1_800_000
+        private const val FPS = 24
         private const val PREFERRED_CODEC = "H264"
         private const val HEARTBEAT_MS = 10_000L
         private const val STATS_MS = 2_000L
         /** 投屏关键帧间隔:花屏恢复 + 中途接入更快出清画 */
         private const val KEYFRAME_INTERVAL_MS = 3_000L
+    }
+
+    // 按画质档位设码率(局域网投屏可适当高)
+    private val minBitrateBps: Int
+    private val maxBitrateBps: Int
+    private val startBitrateBps: Int
+    private val maxCaptureW: Int
+    private val maxCaptureH: Int
+
+    init {
+        when (quality.lowercase()) {
+            "720", "720p" -> {
+                maxCaptureW = 1280; maxCaptureH = 720
+                minBitrateBps = 800_000; maxBitrateBps = 3_000_000; startBitrateBps = 2_200_000
+            }
+            "native", "raw", "full" -> {
+                maxCaptureW = 2560; maxCaptureH = 1600
+                minBitrateBps = 1_200_000; maxBitrateBps = 6_000_000; startBitrateBps = 4_000_000
+            }
+            else -> { // 1080 默认
+                maxCaptureW = 1920; maxCaptureH = 1080
+                minBitrateBps = 1_000_000; maxBitrateBps = 5_000_000; startBitrateBps = 3_500_000
+            }
+        }
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -101,7 +128,7 @@ class RtcClient(
     private var reconnectRunnable: Runnable? = null
 
     /** 当前发送码率上限(自适应) */
-    @Volatile private var currentMaxBitrate = START_BITRATE_BPS
+    @Volatile private var currentMaxBitrate = 0
     private var lastBytesSent = -1L
     private var lastPacketsSent = -1L
     private var lastNackCount = -1L
@@ -113,7 +140,9 @@ class RtcClient(
     fun start() {
         running = true
         kicked = false
+        currentMaxBitrate = startBitrateBps
         scheduler = Executors.newSingleThreadScheduledExecutor()
+        Log.i(TAG, "画质档位=$quality 上限 ${maxCaptureW}x${maxCaptureH} 码率 ${startBitrateBps / 1000}~${maxBitrateBps / 1000}kbps @${FPS}fps")
         connectSignaling()
     }
 
@@ -399,8 +428,8 @@ class RtcClient(
         val metrics = android.util.DisplayMetrics()
         @Suppress("DEPRECATION")
         wm.defaultDisplay.getRealMetrics(metrics)
-        val maxW = 1280
-        val maxH = 720
+        val maxW = maxCaptureW
+        val maxH = maxCaptureH
         var cw = metrics.widthPixels
         var ch = metrics.heightPixels
         if (cw > maxW || ch > maxH) {
@@ -410,9 +439,12 @@ class RtcClient(
         }
         if (cw % 2 != 0) cw -= 1
         if (ch % 2 != 0) ch -= 1
+        // 最低也别太小
+        if (cw < 640) { cw = 640; if (cw % 2 != 0) cw -= 1 }
+        if (ch < 360) { ch = 360; if (ch % 2 != 0) ch -= 1 }
         captureWidth = cw
         captureHeight = ch
-        Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 抓屏 ${cw}x${ch} @${FPS}fps")
+        Log.i(TAG, "屏幕 ${metrics.widthPixels}x${metrics.heightPixels} → 抓屏 ${cw}x${ch} @${FPS}fps (quality=$quality)")
 
         surfaceHelper = SurfaceTextureHelper.create("CaptureThread", eglBase!!.eglBaseContext)
         videoSource = factory!!.createVideoSource(true)
@@ -445,33 +477,35 @@ class RtcClient(
         } catch (_: Exception) {}
 
         videoSender = peerConnection!!.addTrack(videoTrack, listOf(STREAM_ID))
-        currentMaxBitrate = START_BITRATE_BPS
+        currentMaxBitrate = startBitrateBps
         Log.i(TAG, "VideoTrack 已加入 (stream=$STREAM_ID)")
     }
 
     private fun applySenderConstraints() {
-        applySenderBitrate(currentMaxBitrate, log = true)
+        applySenderBitrate(currentMaxBitrate.coerceAtLeast(startBitrateBps), log = true)
     }
 
     private fun applySenderBitrate(bitrateBps: Int, log: Boolean = false) {
         val sender = videoSender ?: return
+        val capped = bitrateBps.coerceIn(minBitrateBps, maxBitrateBps)
         try {
             val params = sender.parameters
             if (params.encodings.isNotEmpty()) {
                 val enc = params.encodings[0]
-                enc.maxBitrateBps = bitrateBps
-                try { enc.minBitrateBps = minOf(MIN_BITRATE_BPS, bitrateBps) } catch (_: Exception) {}
+                enc.maxBitrateBps = capped
+                try { enc.minBitrateBps = minBitrateBps } catch (_: Exception) {}
                 try { enc.maxFramerate = FPS } catch (_: Exception) {}
                 try { enc.scaleResolutionDownBy = 1.0 } catch (_: Exception) {}
             }
             try {
+                // 投屏文字优先保分辨率,宁可降帧也不糊化
                 params.degradationPreference =
                     RtpParameters.DegradationPreference.MAINTAIN_RESOLUTION
             } catch (_: Exception) {}
             sender.parameters = params
-            currentMaxBitrate = bitrateBps
+            currentMaxBitrate = capped
             if (log) {
-                Log.i(TAG, "RtpSender 约束: maxBitrate=${bitrateBps / 1000}kbps maxFps=$FPS")
+                Log.i(TAG, "RtpSender 约束: maxBitrate=${capped / 1000}kbps maxFps=$FPS quality=$quality")
             }
         } catch (e: Exception) {
             Log.w(TAG, "设置 RtpSender 参数失败: ${e.message}")
@@ -610,7 +644,7 @@ class RtcClient(
             override fun onSetSuccess() {
                 remoteReady = true
                 flushPendingIce()
-                currentMaxBitrate = START_BITRATE_BPS
+                currentMaxBitrate = startBitrateBps
                 applySenderConstraints()
                 // 协商完成马上要一帧关键帧,浏览器更快出第一帧清画
                 mainHandler.postDelayed({
@@ -819,7 +853,7 @@ class RtcClient(
                 consecutiveGood = 0
                 if (consecutiveBad >= 2) {
                     val next = (currentMaxBitrate * 0.75).toInt()
-                        .coerceIn(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+                        .coerceIn(minBitrateBps, maxBitrateBps)
                     if (next < currentMaxBitrate - 50_000) {
                         Log.w(TAG, "↓ 弱网降码率 ${currentMaxBitrate / 1000}k → ${next / 1000}k " +
                             "(loss=$fractionLost rtt=$rttMs nackΔ=$nackDelta ql=$qualityLimit)")
@@ -833,9 +867,9 @@ class RtcClient(
             lossLow -> {
                 consecutiveGood++
                 consecutiveBad = 0
-                if (consecutiveGood >= 4 && currentMaxBitrate < MAX_BITRATE_BPS) {
+                if (consecutiveGood >= 4 && currentMaxBitrate < maxBitrateBps) {
                     val next = (currentMaxBitrate * 1.15).toInt()
-                        .coerceIn(MIN_BITRATE_BPS, MAX_BITRATE_BPS)
+                        .coerceIn(minBitrateBps, maxBitrateBps)
                     if (next > currentMaxBitrate + 50_000) {
                         Log.i(TAG, "↑ 网络恢复升码率 ${currentMaxBitrate / 1000}k → ${next / 1000}k")
                         applySenderBitrate(next)

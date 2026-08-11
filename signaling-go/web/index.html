@@ -153,12 +153,15 @@
           try {
             const stats = await pc.getStats();
             let inbound = null;
+            const codecs = {};
             stats.forEach((r) => {
-              if (r.type === "inbound-rtp" && r.kind === "video") inbound = r;
+              if (r.type === "codec" && r.mimeType) codecs[r.id] = r.mimeType;
+              if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) inbound = r;
             });
             if (inbound) {
+              const mime = inbound.mimeType || (inbound.codecId && codecs[inbound.codecId]) || "";
               console.log("[webrtc] inbound-rtp", {
-                mimeType: inbound.mimeType,
+                mimeType: mime,
                 framesPerSecond: inbound.framesPerSecond,
                 framesDecoded: inbound.framesDecoded,
                 bytesReceived: inbound.bytesReceived,
@@ -181,7 +184,11 @@
           try {
             const stats = await pc.getStats();
             let inbound = null;
+            const codecs = {};
             stats.forEach((r) => {
+              if (r.type === "codec" && r.mimeType) {
+                codecs[r.id] = r.mimeType;
+              }
               if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
                 inbound = r;
               }
@@ -194,7 +201,13 @@
                 ? Math.round((inbound.bytesReceived - window.__lastBytes) * 8 / 5 / 1000)
                 : "-";
               window.__lastBytes = inbound.bytesReceived;
-              const codec = (inbound.mimeType || "").replace("video/", "") || "?";
+              // inbound-rtp 常常没有 mimeType,要从 codecId 反查
+              let codec = "?";
+              if (inbound.mimeType) {
+                codec = String(inbound.mimeType).replace(/^video\//i, "");
+              } else if (inbound.codecId && codecs[inbound.codecId]) {
+                codec = String(codecs[inbound.codecId]).replace(/^video\//i, "");
+              }
               const lost = inbound.packetsLost != null ? inbound.packetsLost : 0;
               setStatus(
                 "投屏中 " + video.videoWidth + "x" + video.videoHeight +

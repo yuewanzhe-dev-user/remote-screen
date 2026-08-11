@@ -34,6 +34,7 @@ class ScreenCastService : Service() {
         const val EXTRA_SERVER = "server" // 信令服务器 host:port
         const val EXTRA_ROOM = "room"     // 房间号
         const val EXTRA_TOKEN = "token"   // 可选,默认空
+        const val EXTRA_QUALITY = "quality" // 720 / 1080 / native
 
         @Volatile var statusText: String = "未连接"
         @Volatile var onStatusChange: ((String) -> Unit)? = null
@@ -55,6 +56,7 @@ class ScreenCastService : Service() {
         val server = intent.getStringExtra(EXTRA_SERVER) ?: return START_NOT_STICKY
         val room = intent.getStringExtra(EXTRA_ROOM) ?: return START_NOT_STICKY
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
+        val quality = intent.getStringExtra(EXTRA_QUALITY) ?: "1080"
 
         startForeground()
 
@@ -68,7 +70,7 @@ class ScreenCastService : Service() {
         // 启动 RtcClient(在主线程构造,内部自己切线程)
         try {
             statusText = "启动中…"
-            rtcClient = RtcClient(this, data, server, room, token) { status ->
+            rtcClient = RtcClient(this, data, server, room, token, quality) { status ->
                 statusText = status
                 onStatusChange?.invoke(status)
                 // 被顶替/教师断开后自动结束前台服务

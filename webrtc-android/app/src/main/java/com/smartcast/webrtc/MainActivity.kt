@@ -12,6 +12,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -35,8 +36,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBoardsHint: TextView
     private lateinit var layoutAdvanced: LinearLayout
     private lateinit var tvAdvancedToggle: TextView
+    private lateinit var spQuality: Spinner
     private lateinit var prefs: SharedPreferences
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // 与 Spinner 顺序一致
+    private val qualityKeys = listOf("1080", "720", "native")
+    private val qualityLabels = listOf(
+        "1080p 清晰(推荐)",
+        "720p 流畅",
+        "原分辨率(更吃性能/可能糊或失败)"
+    )
 
     private var discovery: BoardDiscovery? = null
     private var lastBoardNames: List<String>? = null
@@ -77,9 +87,17 @@ class MainActivity : AppCompatActivity() {
         tvBoardsHint = findViewById(R.id.tvBoardsHint)
         layoutAdvanced = findViewById(R.id.layoutAdvanced)
         tvAdvancedToggle = findViewById(R.id.tvAdvancedToggle)
+        spQuality = findViewById(R.id.spQuality)
 
         etServer.setText(prefs.getString("server", ""))
         etRoom.setText(prefs.getString("room", "default"))
+
+        spQuality.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, qualityLabels
+        )
+        val savedQ = prefs.getString("quality", "1080") ?: "1080"
+        val qIndex = qualityKeys.indexOf(savedQ).let { if (it >= 0) it else 0 }
+        spQuality.setSelection(qIndex)
 
         tvAdvancedToggle.setOnClickListener {
             val show = layoutAdvanced.visibility != View.VISIBLE
@@ -209,15 +227,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun selectedQuality(): String {
+        val i = spQuality.selectedItemPosition.coerceIn(0, qualityKeys.lastIndex)
+        return qualityKeys[i]
+    }
+
     private fun startCastService(resultCode: Int, data: Intent) {
         val server = pendingServer.ifEmpty { etServer.text.toString().trim() }
         val room = pendingRoom.ifEmpty { etRoom.text.toString().trim().ifEmpty { "default" } }
         val token = pendingToken
+        val quality = selectedQuality()
         if (server.isEmpty()) {
             Toast.makeText(this, "未选择黑板", Toast.LENGTH_SHORT).show()
             return
         }
         if (pendingBoardName.isNotEmpty()) rememberBoard(pendingBoardName)
+        prefs.edit().putString("quality", quality).apply()
 
         val intent = Intent(this, ScreenCastService::class.java).apply {
             putExtra(ScreenCastService.EXTRA_RESULT_CODE, resultCode)
@@ -225,9 +250,10 @@ class MainActivity : AppCompatActivity() {
             putExtra(ScreenCastService.EXTRA_SERVER, server)
             putExtra(ScreenCastService.EXTRA_ROOM, room)
             putExtra(ScreenCastService.EXTRA_TOKEN, token)
+            putExtra(ScreenCastService.EXTRA_QUALITY, quality)
         }
         startForegroundService(intent)
-        updateUi(true, "启动中…")
+        updateUi(true, "启动中($quality)…")
     }
 
     private fun updateUi(casting: Boolean, status: String) {
