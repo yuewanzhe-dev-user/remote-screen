@@ -4,13 +4,6 @@ name: 构建
 on:
   push:
     branches: [main]
-    paths:
-      # 任意一个端目录或本配置改动都触发(具体哪个 job 跑由下方 paths 过滤决定)
-      - 'sender-android/**'
-      - 'receiver-windows/**'
-      - 'webrtc-android/**'
-      - 'signaling-go/**'
-      - '.github/workflows/**'
   workflow_dispatch:
     inputs:
       target:
@@ -18,42 +11,41 @@ on:
         required: false
         default: 'all'
 
-# 一个 push 同时触发的 job,默认并行跑
+# 每个 job 内部判断:本次改动是否落在自己的目录范围
+# 改动文件列表直接读 github.event.head_commit(无需 git diff,零成本)
+# workflow 本身(.github/workflows/)改动 → 所有 job 都构建
+# workflow_dispatch 手动触发 → 用 inputs.target 控制
+
 jobs:
 
   # ============ TCP 方案:pad 端 APK ============
-  # 只在 sender-android/ 或 workflow 本身改动时跑
   build-pad:
     name: 构建 pad 端 APK (TCP)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'pad') ||
-      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查是否需要构建(路径过滤)
+      - name: 检查是否需要构建
         id: check
+        env:
+          TARGET: ${{ github.event.inputs.target }}
         run: |
-          # 手动触发时强制构建;push 时只在 sender-android 或 workflow 改动才构建
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+          set +e
+          # 手动触发:按 target 参数决定
+          if [[ -n "$TARGET" ]]; then
+            if [[ "$TARGET" == "all" || "$TARGET" == "pad" ]]; then
+              echo "skip=false" >> $GITHUB_OUTPUT; echo "手动触发,构建 pad"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT; echo "target=$TARGET,跳过 pad"
+            fi
+            exit 0
+          fi
+          # push 触发:读本次改动文件列表(GitHub 直接提供,不用 git diff)
+          FILES_JSON='${{ toJSON(github.event.head_commit.modified) }}${{ toJSON(github.event.head_commit.added) }}${{ toJSON(github.event.head_commit.removed) }}'
+          if echo "$FILES_JSON" | grep -qE '(sender-android/|workflows/)'; then
+            echo "skip=false" >> $GITHUB_OUTPUT; echo "检测到 pad 端改动,构建"
           else
-            # before 可能是全零(首次推送),用兜底方式取改动文件
-            BEFORE="${{ github.event.before }}"
-            if [[ "$BEFORE" =~ ^0+$ ]]; then
-              FILES=$(git ls-files)
-            else
-              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
-            fi
-            if echo "$FILES" | grep -qE '^(sender-android/|\.github/workflows/)'; then
-              echo "skip=false" >> $GITHUB_OUTPUT
-              echo "检测到 pad 端改动,开始构建"
-            else
-              echo "skip=true" >> $GITHUB_OUTPUT
-              echo "本次未改动 pad 端,跳过"
-            fi
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "本次未改动 pad 端,跳过"
           fi
 
       - name: 安装 JDK 17
@@ -92,36 +84,31 @@ jobs:
           retention-days: 30
 
   # ============ TCP 方案:黑板端 EXE ============
-  # 只在 receiver-windows/ 或 workflow 本身改动时跑
   build-exe:
     name: 构建黑板端 EXE (TCP)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'exe') ||
-      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查是否需要构建(路径过滤)
+      - name: 检查是否需要构建
         id: check
+        env:
+          TARGET: ${{ github.event.inputs.target }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+          set +e
+          if [[ -n "$TARGET" ]]; then
+            if [[ "$TARGET" == "all" || "$TARGET" == "exe" ]]; then
+              echo "skip=false" >> $GITHUB_OUTPUT; echo "手动触发,构建 exe"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT; echo "target=$TARGET,跳过 exe"
+            fi
+            exit 0
+          fi
+          FILES_JSON='${{ toJSON(github.event.head_commit.modified) }}${{ toJSON(github.event.head_commit.added) }}${{ toJSON(github.event.head_commit.removed) }}'
+          if echo "$FILES_JSON" | grep -qE '(receiver-windows/|workflows/)'; then
+            echo "skip=false" >> $GITHUB_OUTPUT; echo "检测到黑板端改动,构建"
           else
-            BEFORE="${{ github.event.before }}"
-            if [[ "$BEFORE" =~ ^0+$ ]]; then
-              FILES=$(git ls-files)
-            else
-              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
-            fi
-            if echo "$FILES" | grep -qE '^(receiver-windows/|\.github/workflows/)'; then
-              echo "skip=false" >> $GITHUB_OUTPUT
-              echo "检测到黑板端改动,开始构建"
-            else
-              echo "skip=true" >> $GITHUB_OUTPUT
-              echo "本次未改动黑板端,跳过"
-            fi
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "本次未改动黑板端,跳过"
           fi
 
       - name: 安装 Go
@@ -148,42 +135,36 @@ jobs:
           retention-days: 30
 
   # ============ WebRTC 方案:pad 端 APK ============
-  # 只在 webrtc-android/ 或 workflow 本身改动时跑
   build-webrtc-pad:
     name: 构建 pad 端 APK (WebRTC)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'webrtc') ||
-      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检查是否需要构建(路径过滤 + 目录是否存在)
+      - name: 检查是否需要构建
         id: check
+        env:
+          TARGET: ${{ github.event.inputs.target }}
         run: |
+          set +e
           # webrtc-android 目录还没建,先检查存在性
           if [[ ! -d "webrtc-android" ]] || [[ -z "$(ls -A webrtc-android/ 2>/dev/null)" ]]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "webrtc-android 目录为空,跳过(代码尚未编写)"
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "webrtc-android 目录为空,跳过"
             exit 0
           fi
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+          if [[ -n "$TARGET" ]]; then
+            if [[ "$TARGET" == "all" || "$TARGET" == "webrtc" ]]; then
+              echo "skip=false" >> $GITHUB_OUTPUT; echo "手动触发,构建 WebRTC pad"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT; echo "target=$TARGET,跳过 WebRTC pad"
+            fi
+            exit 0
+          fi
+          FILES_JSON='${{ toJSON(github.event.head_commit.modified) }}${{ toJSON(github.event.head_commit.added) }}${{ toJSON(github.event.head_commit.removed) }}'
+          if echo "$FILES_JSON" | grep -qE '(webrtc-android/|workflows/)'; then
+            echo "skip=false" >> $GITHUB_OUTPUT; echo "检测到 WebRTC pad 端改动,构建"
           else
-            BEFORE="${{ github.event.before }}"
-            if [[ "$BEFORE" =~ ^0+$ ]]; then
-              FILES=$(git ls-files)
-            else
-              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
-            fi
-            if echo "$FILES" | grep -qE '^(webrtc-android/|\.github/workflows/)'; then
-              echo "skip=false" >> $GITHUB_OUTPUT
-              echo "检测到 WebRTC pad 端改动,开始构建"
-            else
-              echo "skip=true" >> $GITHUB_OUTPUT
-              echo "本次未改动 WebRTC pad 端,跳过"
-            fi
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "本次未改动 WebRTC pad 端,跳过"
           fi
 
       - name: 安装 JDK 17
@@ -222,41 +203,37 @@ jobs:
           retention-days: 30
 
   # ============ WebRTC 方案:信令服务器 EXE ============
-  # 只在 signaling-go/ 或 workflow 本身改动时跑
   build-signaling:
     name: 构建信令服务器 EXE (WebRTC)
     runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'workflow_dispatch' &&
-      (github.event.inputs.target == 'all' || github.event.inputs.target == 'signaling') ||
-      github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
 
       - name: 检查是否需要构建
         id: check
+        env:
+          TARGET: ${{ github.event.inputs.target }}
         run: |
-          if [[ ! -d "signaling-go" ]] || [[ -z "$(ls -A signaling-go/ 2>/dev/null)" ]]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "signaling-go 目录为空,跳过"
+          set +e
+          FILES_JSON='${{ toJSON(github.event.head_commit.modified) }}${{ toJSON(github.event.head_commit.added) }}${{ toJSON(github.event.head_commit.removed) }}'
+          # 手动触发 + 目录有内容,直接构建
+          if [[ -n "$TARGET" ]]; then
+            if [[ "$TARGET" == "all" || "$TARGET" == "signaling" ]]; then
+              echo "skip=false" >> $GITHUB_OUTPUT; echo "手动触发,构建信令服务器"
+            else
+              echo "skip=true" >> $GITHUB_OUTPUT; echo "target=$TARGET,跳过信令服务器"
+            fi
             exit 0
           fi
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "skip=false" >> $GITHUB_OUTPUT
+          # push:signaling-go 还没写 main.go,先检查
+          if [[ ! -f "signaling-go/main.go" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "signaling-go/main.go 不存在,跳过"
+            exit 0
+          fi
+          if echo "$FILES_JSON" | grep -qE '(signaling-go/|workflows/)'; then
+            echo "skip=false" >> $GITHUB_OUTPUT; echo "检测到信令服务器改动,构建"
           else
-            BEFORE="${{ github.event.before }}"
-            if [[ "$BEFORE" =~ ^0+$ ]]; then
-              FILES=$(git ls-files)
-            else
-              FILES=$(git diff --name-only "$BEFORE" ${{ github.sha }})
-            fi
-            if echo "$FILES" | grep -qE '^(signaling-go/|\.github/workflows/)'; then
-              echo "skip=false" >> $GITHUB_OUTPUT
-              echo "检测到信令服务器改动,开始构建"
-            else
-              echo "skip=true" >> $GITHUB_OUTPUT
-              echo "本次未改动信令服务器,跳过"
-            fi
+            echo "skip=true" >> $GITHUB_OUTPUT; echo "本次未改动信令服务器,跳过"
           fi
 
       - name: 安装 Go
