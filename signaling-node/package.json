@@ -1,0 +1,12 @@
+{
+  "name": "smartcast-signaling",
+  "version": "1.0.0",
+  "description": "智慧投屏信令服务器(本机验证用)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
